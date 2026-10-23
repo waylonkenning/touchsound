@@ -1,0 +1,15 @@
+services:
+  touchsound:
+    build: .
+    command:
+      - python
+      - /app/bridge.py
+      - --speaker
+      - ${SOUNDTOUCH_IP:?Set SOUNDTOUCH_IP}
+      - --relay-url
+      - ${RELAY_URL:?Set RELAY_URL to the Docker host LAN URL}
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./stations.json:/app/stations.json:ro
+    restart: unless-stopped
