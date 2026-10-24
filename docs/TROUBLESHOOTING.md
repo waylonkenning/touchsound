@@ -10,6 +10,22 @@
 
 The button bridge does not use the speaker's `/key` endpoint to poll for button presses. It needs the WebSocket notification connection to stay open.
 
+## A SoundTouch speaker does not appear in the menu bar app
+
+The app discovers speakers by browsing Bonjour service `_soundtouch._tcp` on the local network. Check from Terminal:
+
+```sh
+dns-sd -B _soundtouch._tcp local
+```
+
+The speaker and Mac must be on a network that allows mDNS multicast. Guest Wi-Fi, client isolation, or separate VLANs may block discovery. Confirm **System Settings → Privacy & Security → Local Network** allows TouchSound, then choose **Search Again** from the app's **SoundTouch Speakers** submenu.
+
+To inspect a discovered service, resolve its displayed instance name:
+
+```sh
+dns-sd -L "Living room" _soundtouch._tcp local
+```
+
 ## Preset event appears, but playback does not start
 
 - Read the error printed after `Preset N playback error`.

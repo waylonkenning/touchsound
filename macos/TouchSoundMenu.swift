@@ -5,8 +5,16 @@ import Network
 private let configURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/TouchSound/config.json")
 final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private struct DiscoveredSpeaker {
+        let id: String
+        let name: String
+        let address: String
+    }
+
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
+    private let speakerMenu = NSMenu()
+    private let speakerMenuItem = NSMenuItem(title: "SoundTouch Speakers", action: nil, keyEquivalent: "")
     private let bridgeStatusItem = NSMenuItem(title: "Bridge: checking…", action: nil, keyEquivalent: "")
     private let websocketItem = NSMenuItem(title: "Button listener: checking…", action: nil, keyEquivalent: "")
     private let speakerItem = NSMenuItem(title: "Speaker: checking…", action: nil, keyEquivalent: "")
@@ -21,6 +29,11 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var latestStatus: [String: Any] = [:]
     private var config: [String: Any] = [:]
     private var speakerProbe: NWConnection?
+    private var speakerBrowser: NWBrowser?
+    private var speakerNames: [String: String] = [:]
+    private var discoveredSpeakers: [String: DiscoveredSpeaker] = [:]
+    private var resolvingSpeakers: [String: NWConnection] = [:]
+    private var failedSpeakerResolutions = Set<String>()
     private var localSpeakerReachable: Bool?
     private var lastProbeAt = Date.distantPast
     private var refreshTimer: Timer?
@@ -49,6 +62,7 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
         loadConfig()
         configureMenu()
+        startSpeakerDiscovery()
         startBridgeService()
         refreshStatus()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -60,12 +74,18 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
         speakerProbe?.cancel()
+        speakerBrowser?.cancel()
+        resolvingSpeakers.values.forEach { $0.cancel() }
         serviceShouldRun = false
         serviceProcess?.terminate()
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        updateMenuLabels()
+        if menu === speakerMenu {
+            updateSpeakerMenu()
+        } else {
+            updateMenuLabels()
+        }
     }
 
     private func configureMenu() {
@@ -80,6 +100,11 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.isEnabled = false
             menu.addItem(item)
         }
+        menu.addItem(.separator())
+        speakerMenu.autoenablesItems = false
+        speakerMenu.delegate = self
+        speakerMenuItem.submenu = speakerMenu
+        menu.addItem(speakerMenuItem)
         menu.addItem(.separator())
         for (item, selector) in [(startStopItem, #selector(toggleService)), (restartItem, #selector(restartBridge)), (cycleSpeakerItem, #selector(cycleSpeaker))] {
             item.target = self
@@ -108,6 +133,185 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var speakerAddress: String {
         config["speaker"] as? String ?? "192.168.1.100"
+    }
+
+    private func startSpeakerDiscovery() {
+        let browser = NWBrowser(for: .bonjour(type: "_soundtouch._tcp", domain: "local."), using: .tcp)
+        speakerBrowser = browser
+        browser.browseResultsChangedHandler = { [weak self, weak browser] results, _ in
+            DispatchQueue.main.async {
+                guard let self, let browser, self.speakerBrowser === browser else { return }
+                self.updateSpeakerResults(results)
+            }
+        }
+        browser.stateUpdateHandler = { [weak self, weak browser] state in
+            DispatchQueue.main.async {
+                guard let self, let browser, self.speakerBrowser === browser else { return }
+                if case .failed = state {
+                    self.updateSpeakerMenu()
+                }
+            }
+        }
+        browser.start(queue: .main)
+    }
+
+    private func updateSpeakerResults(_ results: Set<NWBrowser.Result>) {
+        var current: [String: (name: String, endpoint: NWEndpoint)] = [:]
+        for result in results {
+            guard case let .service(name, type, domain, interface) = result.endpoint else { continue }
+            let interfaceName = interface?.name ?? ""
+            let id = "\(name)|\(type)|\(domain)|\(interfaceName)"
+            current[id] = (name, result.endpoint)
+        }
+
+        let removed = Set(speakerNames.keys).subtracting(current.keys)
+        for id in removed {
+            resolvingSpeakers.removeValue(forKey: id)?.cancel()
+            discoveredSpeakers.removeValue(forKey: id)
+            failedSpeakerResolutions.remove(id)
+        }
+        speakerNames = current.mapValues(\.name)
+
+        for (id, speaker) in current where discoveredSpeakers[id] == nil && resolvingSpeakers[id] == nil {
+            failedSpeakerResolutions.remove(id)
+            resolveSpeaker(id: id, name: speaker.name, endpoint: speaker.endpoint)
+        }
+        updateSpeakerMenu()
+    }
+
+    private func resolveSpeaker(id: String, name: String, endpoint: NWEndpoint) {
+        let connection = NWConnection(to: endpoint, using: .tcp)
+        resolvingSpeakers[id] = connection
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            switch state {
+            case .ready:
+                var address: String?
+                if let remote = connection.currentPath?.remoteEndpoint,
+                   case let .hostPort(host, _) = remote {
+                    address = self.ipAddress(from: host)
+                }
+                DispatchQueue.main.async {
+                    self.finishSpeakerResolution(id: id, name: name, connection: connection, address: address)
+                }
+            case .failed:
+                DispatchQueue.main.async {
+                    self.finishSpeakerResolution(id: id, name: name, connection: connection, address: nil)
+                }
+            default:
+                break
+            }
+        }
+        connection.start(queue: .main)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak connection] in
+            guard let self, let connection, self.resolvingSpeakers[id] === connection else { return }
+            self.finishSpeakerResolution(id: id, name: name, connection: connection, address: nil)
+        }
+    }
+
+    private func ipAddress(from host: NWEndpoint.Host) -> String? {
+        switch host {
+        case .ipv4(let address):
+            return String(describing: address)
+        case .name(let name, _):
+            return name
+        case .ipv6:
+            return nil
+        @unknown default:
+            return nil
+        }
+    }
+
+    private func finishSpeakerResolution(id: String, name: String, connection: NWConnection, address: String?) {
+        guard resolvingSpeakers[id] === connection else {
+            connection.cancel()
+            return
+        }
+        resolvingSpeakers.removeValue(forKey: id)
+        connection.stateUpdateHandler = nil
+        connection.cancel()
+        if let address {
+            discoveredSpeakers[id] = DiscoveredSpeaker(id: id, name: name, address: address)
+        } else {
+            failedSpeakerResolutions.insert(id)
+        }
+        updateSpeakerMenu()
+    }
+
+    private func updateSpeakerMenu() {
+        speakerMenu.removeAllItems()
+        let devices = discoveredSpeakers.values.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+        speakerMenuItem.title = devices.isEmpty
+            ? "SoundTouch Speakers"
+            : "SoundTouch Speakers (\(devices.count))"
+
+        if speakerNames.isEmpty {
+            let item = NSMenuItem(title: "Searching for SoundTouch speakers…", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            speakerMenu.addItem(item)
+        } else {
+            for (id, name) in speakerNames.sorted(by: { $0.value.localizedCaseInsensitiveCompare($1.value) == .orderedAscending }) {
+                if let speaker = discoveredSpeakers[id] {
+                    let item = NSMenuItem(title: "\(speaker.name) — \(speaker.address)", action: #selector(selectSpeaker(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = speaker.id
+                    item.state = speaker.address == speakerAddress ? .on : .off
+                    speakerMenu.addItem(item)
+                } else {
+                    let detail = failedSpeakerResolutions.contains(id) ? "not responding" : "resolving…"
+                    let item = NSMenuItem(title: "\(name) (\(detail))", action: nil, keyEquivalent: "")
+                    item.isEnabled = false
+                    speakerMenu.addItem(item)
+                }
+            }
+        }
+        speakerMenu.addItem(.separator())
+        let search = NSMenuItem(title: "Search Again", action: #selector(searchSpeakersAgain), keyEquivalent: "")
+        search.target = self
+        speakerMenu.addItem(search)
+    }
+
+    @objc private func searchSpeakersAgain() {
+        speakerBrowser?.cancel()
+        resolvingSpeakers.values.forEach { $0.cancel() }
+        resolvingSpeakers.removeAll()
+        speakerNames.removeAll()
+        discoveredSpeakers.removeAll()
+        failedSpeakerResolutions.removeAll()
+        updateSpeakerMenu()
+        startSpeakerDiscovery()
+    }
+
+    @objc private func selectSpeaker(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let speaker = discoveredSpeakers[id],
+              speaker.address != speakerAddress else { return }
+
+        config["speaker"] = speaker.address
+        config["speakerName"] = speaker.name
+        do {
+            let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: configURL, options: .atomic)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not save the selected speaker"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        speakerProbe?.cancel()
+        speakerProbe = nil
+        localSpeakerReachable = nil
+        lastProbeAt = .distantPast
+        latestStatus = [:]
+        updateSpeakerMenu()
+        updateMenuLabels()
+        restartBridge()
     }
 
     private func refreshStatus() {
@@ -201,7 +405,9 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         websocketItem.title = "Button listener: \(connected ? "Connected" : "Disconnected")"
         let speakerResponding = reachable || localSpeakerReachable == true
         let speakerFailed = !reachable && localSpeakerReachable == false
-        speakerItem.title = "Speaker: \(speakerResponding ? "Responding" : (speakerFailed ? "No response (check Local Network access)" : (bridgeServiceRunning ? "Checking" : "Not checked")))"
+        let speakerName = config["speakerName"] as? String ?? speakerAddress
+        let speakerState = speakerResponding ? "Responding" : (speakerFailed ? "No response (check Local Network access)" : (bridgeServiceRunning ? "Checking" : "Not checked"))
+        speakerItem.title = "Speaker: \(speakerName) · \(speakerState)"
         if let expected, let station {
             playbackItem.title = "Playback: Preset \(expected) · \(station) · \(playing ? "PLAYING" : (speaker["transportState"] as? String ?? "not playing"))"
         } else {

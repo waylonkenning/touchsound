@@ -46,7 +46,7 @@ python3 macos/install.py install --speaker 192.168.1.100 --relay-url http://192.
 
 Replace both example addresses with your speaker and Mac's LAN addresses. The relay URL can be omitted; the installer derives the Mac address used to reach the speaker. A DHCP reservation for the Mac helps keep that URL stable. The installer builds a menu bar app and registers it as a per-user macOS login agent. The app starts the supervised bridge, restarts it if it exits, and is restarted by launchd if the app itself exits. It shows bridge and speaker health under the speaker icon in the menu bar. macOS may ask you to allow TouchSound local network access.
 
-The menu bar app shows whether the listener is connected, whether the speaker responds, the transport playback state, and whether stream data is arriving. It can start, stop, or restart the bridge, request a speaker restart, and open the service log. The speaker restart action asks for confirmation first.
+The menu bar app shows whether the listener is connected, whether the speaker responds, the transport playback state, and whether stream data is arriving. It discovers SoundTouch speakers on the local network with Bonjour; choose one from the **SoundTouch Speakers** menu to switch the bridge to that device. It can also start, stop, or restart the bridge, request a speaker restart, and open the service log. The speaker restart action asks for confirmation first.
 
 To remove the login services and menu bar app while keeping configuration and logs, run:
 

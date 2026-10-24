@@ -37,7 +37,7 @@ Replace the example addresses with the speaker's IP address and the Mac's LAN ad
 
 The installer builds `TouchSound.app` in `~/Applications`, creates a per-user login agent, and starts the menu bar app. When macOS asks, allow TouchSound to access the local network. You can review that setting under **System Settings → Privacy & Security → Local Network**.
 
-Click the speaker icon in the menu bar to view button-listener, speaker, playback, and stream status. The menu can start, stop, or restart the bridge service and request a speaker restart. The login agent stays loaded when you stop the bridge from the menu.
+Click the speaker icon in the menu bar to view button-listener, speaker, playback, and stream status. Open **SoundTouch Speakers** to see devices discovered through Bonjour (`_soundtouch._tcp`). Select a device to save it as the active speaker and restart the bridge. Discovery works when the Mac and speaker share a local network that passes mDNS multicast; guest Wi-Fi or VLAN isolation can block it. The menu can also start, stop, or restart the bridge service and request a speaker restart. The login agent stays loaded when you stop the bridge from the menu.
 
 ### Check and manage the service
 

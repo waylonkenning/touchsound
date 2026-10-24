@@ -54,12 +54,13 @@ def build_app(destination: Path) -> None:
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "TouchSound",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "1.0",
-        "CFBundleVersion": "1",
+        "CFBundleShortVersionString": "1.1",
+        "CFBundleVersion": "2",
         "LSUIElement": True,
         "NSLocalNetworkUsageDescription": (
             "TouchSound checks and controls your Bose SoundTouch speaker on your home network."
         ),
+        "NSBonjourServices": ["_soundtouch._tcp"],
     }
     with (destination / "Contents/Info.plist").open("wb") as output:
         plistlib.dump(info, output)
@@ -108,6 +109,12 @@ def install(args: argparse.Namespace) -> None:
         "servicePath": str(PROJECT / "service.py"),
         "bridgeLabel": BRIDGE_LABEL,
     }
+    try:
+        previous_config = json.loads((SUPPORT / "config.json").read_text(encoding="utf-8"))
+        if previous_config.get("speaker") == args.speaker and previous_config.get("speakerName"):
+            config["speakerName"] = previous_config["speakerName"]
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
     (SUPPORT / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
     with tempfile.TemporaryDirectory(prefix="touchsound-app-") as temp:
