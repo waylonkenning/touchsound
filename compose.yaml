@@ -8,6 +8,10 @@ services:
       - ${SOUNDTOUCH_IP:?Set SOUNDTOUCH_IP}
       - --relay-url
       - ${RELAY_URL:?Set RELAY_URL to the Docker host LAN URL}
+      - --control-token-file
+      - /data/mobile-control.token
+      - --speaker-name
+      - ${SOUNDTOUCH_NAME:-SoundTouch speaker}
       - --event-log
       - /data/speaker-history.jsonl
     ports:

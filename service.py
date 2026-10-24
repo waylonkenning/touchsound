@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -21,6 +22,7 @@ PYTHON = PROJECT / ".venv" / "bin" / "python"
 LOG_DIR = Path.home() / "Library" / "Logs" / "TouchSound"
 STATE_DIR = Path.home() / "Library" / "Application Support" / "TouchSound"
 HISTORY_FILE = STATE_DIR / "speaker-history.jsonl"
+MOBILE_CODE_FILE = STATE_DIR / "mobile-control.token"
 PID_FILE = STATE_DIR / "watchdog.pid"
 LOG_FILE = LOG_DIR / "service.log"
 
@@ -60,13 +62,20 @@ def _read_pid() -> int | None:
 
 
 def _bridge_args(
-    speaker: str, relay_url: str | None, no_auto_reboot: bool, event_log: str | None = None
+    speaker: str,
+    relay_url: str | None,
+    no_auto_reboot: bool,
+    event_log: str | None = None,
+    speaker_name: str | None = None,
 ) -> list[str]:
     command = [str(PYTHON), str(PROJECT / "bridge.py"), "--speaker", speaker]
+    if speaker_name:
+        command.extend(["--speaker-name", speaker_name])
     if relay_url:
         command.extend(["--relay-url", relay_url])
     command.extend(["--state-file", str(STATE_DIR / "runtime.json")])
     command.extend(["--event-log", event_log or str(HISTORY_FILE)])
+    command.extend(["--control-token-file", str(MOBILE_CODE_FILE)])
     if no_auto_reboot:
         command.append("--no-auto-reboot")
     return command
@@ -83,7 +92,9 @@ def _run_watchdog(args: argparse.Namespace) -> None:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    command = _bridge_args(args.speaker, args.relay_url, args.no_auto_reboot, args.event_log)
+    command = _bridge_args(
+        args.speaker, args.relay_url, args.no_auto_reboot, args.event_log, args.speaker_name
+    )
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PATH"] = ":".join(dict.fromkeys([
@@ -145,6 +156,8 @@ def start(args: argparse.Namespace) -> None:
     command = [str(PYTHON), str(Path(__file__).resolve()), "run", "--speaker", args.speaker]
     if args.relay_url:
         command.extend(["--relay-url", args.relay_url])
+    if args.speaker_name:
+        command.extend(["--speaker-name", args.speaker_name])
     if args.no_auto_reboot:
         command.append("--no-auto-reboot")
     if args.event_log:
@@ -199,6 +212,22 @@ def status(_args: argparse.Namespace) -> None:
     print(f"Log: {LOG_FILE}")
 
 
+def mobile_code(_args: argparse.Namespace) -> None:
+    """Show the phone pairing code and LAN URL for this TouchSound install."""
+    try:
+        code = MOBILE_CODE_FILE.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise SystemExit(f"Phone access code is not ready yet: {exc}") from exc
+    try:
+        config = json.loads((STATE_DIR / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        config = {}
+    relay_url = config.get("relayURL") if isinstance(config, dict) else None
+    print(f"Phone web app: {relay_url or 'http://<this-mac-ip>:8765'}")
+    print(f"Pairing code: {code}")
+    print("Enter this code in the phone browser. Paired sessions end when TouchSound restarts; the code remains valid.")
+
+
 def cycle_speaker(args: argparse.Namespace) -> None:
     """Restart a SoundTouch speaker through its local diagnostic shell."""
     try:
@@ -213,6 +242,7 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     start_parser = commands.add_parser("start", help="Start the detached watchdog and bridge")
     start_parser.add_argument("--speaker", required=True, help="SoundTouch IP or hostname")
+    start_parser.add_argument("--speaker-name", help="Friendly speaker name shown in the phone app")
     start_parser.add_argument("--relay-url", help="LAN URL the speaker can reach")
     start_parser.add_argument("--event-log", help="Path for the 48-hour speaker state history")
     start_parser.add_argument("--no-auto-reboot", action="store_true", help="Disable automatic speaker reboot")
@@ -223,11 +253,14 @@ def main() -> None:
     uninstall_parser.set_defaults(handler=stop)
     status_parser = commands.add_parser("status", help="Show watchdog and bridge health")
     status_parser.set_defaults(handler=status)
+    mobile_parser = commands.add_parser("mobile-code", help="Show the phone web app URL and pairing code")
+    mobile_parser.set_defaults(handler=mobile_code)
     cycle_parser = commands.add_parser("cycle-speaker", help="Restart the speaker using its local diagnostic shell")
     cycle_parser.add_argument("--speaker", required=True, help="SoundTouch IP or hostname")
     cycle_parser.set_defaults(handler=cycle_speaker)
     run_parser = commands.add_parser("run", help="Internal watchdog loop")
     run_parser.add_argument("--speaker", required=True)
+    run_parser.add_argument("--speaker-name")
     run_parser.add_argument("--relay-url")
     run_parser.add_argument("--no-auto-reboot", action="store_true")
     run_parser.add_argument("--event-log")

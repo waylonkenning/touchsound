@@ -9,6 +9,7 @@ import os
 import plistlib
 import shutil
 import socket
+import secrets
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,6 +21,7 @@ APP_IDENTIFIER = "com.waylonkenning.touchsound.MenuBar"
 BRIDGE_LABEL = "com.waylonkenning.touchsound.bridge"
 MENU_LABEL = "com.waylonkenning.touchsound.menu"
 SUPPORT = Path.home() / "Library/Application Support/TouchSound"
+MOBILE_CODE_FILE = SUPPORT / "mobile-control.token"
 LOGS = Path.home() / "Library/Logs/TouchSound"
 APPLICATIONS = Path.home() / "Applications"
 AGENTS = Path.home() / "Library/LaunchAgents"
@@ -76,6 +78,17 @@ def launchctl(args: list[str]) -> None:
     run(["/bin/launchctl", *args], check=False)
 
 
+def ensure_mobile_code() -> None:
+    SUPPORT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        descriptor = os.open(MOBILE_CODE_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        MOBILE_CODE_FILE.chmod(0o600)
+    else:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(f"{secrets.randbelow(1_000_000_000_000):012d}\n")
+
+
 def install(args: argparse.Namespace) -> None:
     python = PROJECT / ".venv/bin/python"
     if not python.is_file():
@@ -99,6 +112,7 @@ def install(args: argparse.Namespace) -> None:
     event_log = SUPPORT / "speaker-history.jsonl"
     LOGS.mkdir(parents=True, exist_ok=True)
     SUPPORT.mkdir(parents=True, exist_ok=True)
+    ensure_mobile_code()
     APPLICATIONS.mkdir(parents=True, exist_ok=True)
     AGENTS.mkdir(parents=True, exist_ok=True)
     config = {
@@ -110,6 +124,7 @@ def install(args: argparse.Namespace) -> None:
         "servicePath": str(PROJECT / "service.py"),
         "bridgeLabel": BRIDGE_LABEL,
         "eventLogPath": str(event_log),
+        "controlTokenPath": str(MOBILE_CODE_FILE),
     }
     try:
         previous_config = json.loads((SUPPORT / "config.json").read_text(encoding="utf-8"))
@@ -163,6 +178,7 @@ def install(args: argparse.Namespace) -> None:
     print(f"Logs: {LOGS}")
     print("TouchSound will start when you log in. macOS may ask to allow local network access.")
     print("Use the speaker icon in the menu bar to view health and control the service.")
+    print("Choose Open Phone Web App in the menu bar to copy its pairing code.")
 
 
 def uninstall(_args: argparse.Namespace) -> None:

@@ -24,6 +24,7 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let startStopItem = NSMenuItem(title: "Stop Bridge Service", action: #selector(toggleService), keyEquivalent: "")
     private let restartItem = NSMenuItem(title: "Restart Bridge", action: #selector(restartBridge), keyEquivalent: "")
     private let cycleSpeakerItem = NSMenuItem(title: "Restart SoundTouch Speaker…", action: #selector(cycleSpeaker), keyEquivalent: "")
+    private let mobileWebItem = NSMenuItem(title: "Open Phone Web App…", action: #selector(openMobileWebApp), keyEquivalent: "")
     private let logItem = NSMenuItem(title: "Open Service Log", action: #selector(openLog), keyEquivalent: "")
     private let historyItem = NSMenuItem(title: "Open Speaker History (48 h)", action: #selector(openSpeakerHistory), keyEquivalent: "")
 
@@ -112,6 +113,10 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.action = selector
             menu.addItem(item)
         }
+        menu.addItem(.separator())
+        mobileWebItem.target = self
+        mobileWebItem.action = #selector(openMobileWebApp)
+        menu.addItem(mobileWebItem)
         menu.addItem(.separator())
         logItem.target = self
         logItem.action = #selector(openLog)
@@ -507,6 +512,9 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: pythonPath)
                 var arguments = [servicePath, "run", "--speaker", self.speakerAddress]
+                if let speakerName = self.config["speakerName"] as? String, !speakerName.isEmpty {
+                    arguments += ["--speaker-name", speakerName]
+                }
                 if let relayURL = self.config["relayURL"] as? String, !relayURL.isEmpty {
                     arguments += ["--relay-url", relayURL]
                 }
@@ -591,6 +599,42 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let log = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/TouchSound/service.log")
         NSWorkspace.shared.open(log)
+    }
+
+    @objc private func openMobileWebApp() {
+        let relayText = config["relayURL"] as? String ?? ""
+        guard let url = URL(string: relayText), url.scheme == "http", url.host != nil else {
+            let alert = NSAlert()
+            alert.messageText = "Phone web app address is unavailable"
+            alert.informativeText = "Reinstall TouchSound or set a LAN relay URL in its configuration."
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        let codePath = config["controlTokenPath"] as? String
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/TouchSound/mobile-control.token").path
+        guard let code = try? String(contentsOfFile: codePath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              code.count == 12 else {
+            let alert = NSAlert()
+            alert.messageText = "Phone access code is not ready"
+            alert.informativeText = "Start or restart TouchSound, then choose this option again."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Open TouchSound on your phone"
+        alert.informativeText = "On the same Wi-Fi network, open:\n\(url.absoluteString)\n\nPairing code: \(code)\n\nThe code is copied to the Mac clipboard so you can paste it on your phone."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Copy Code & Open")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        NSWorkspace.shared.open(url)
     }
 
     @objc private func openSpeakerHistory() {

@@ -1,0 +1,17 @@
+{
+  "name": "TouchSound",
+  "short_name": "TouchSound",
+  "description": "Local control for the TouchSound speaker bridge.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#171b19",
+  "theme_color": "#171b19",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

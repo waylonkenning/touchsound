@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hmac
+import ipaddress
 import json
+import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -19,6 +23,14 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "stations.json"
 SLOT_PATTERN = re.compile(r"^/radio/([1-6])\.json$")
 STREAM_PATTERN = re.compile(r"^/stream/([1-6])$")
+WEB_ROOT = ROOT / "web"
+WEB_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json; charset=utf-8"),
+    "/icon.svg": ("icon.svg", "image/svg+xml"),
+}
 
 
 def load_stations() -> dict[str, dict[str, str]]:
@@ -55,13 +67,119 @@ def load_stations() -> dict[str, dict[str, str]]:
     return stations
 
 
+class MobileAccess:
+    """Pair phone browsers with short-lived control sessions using a local code."""
+
+    def __init__(self, token_file: Path) -> None:
+        self.token_file = token_file.expanduser()
+        self.code = self._load_or_create_code()
+        self._sessions: set[str] = set()
+        self._failures: dict[str, list[float]] = {}
+        self._locked_until: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def _load_or_create_code(self) -> str:
+        self.token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            code = self.token_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            code = f"{secrets.randbelow(1_000_000_000_000):012d}"
+            try:
+                descriptor = os.open(self.token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                code = self.token_file.read_text(encoding="utf-8").strip()
+            else:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                    output.write(code + "\n")
+        if not re.fullmatch(r"\d{12}", code):
+            raise ValueError(f"Mobile access code in {self.token_file} must contain exactly 12 digits")
+        try:
+            self.token_file.chmod(0o600)
+        except OSError:
+            pass
+        return code
+
+    def pair(self, client_ip: str, candidate: str) -> tuple[str | None, int | None]:
+        """Return a session token, or a retry delay when the code is rejected."""
+        try:
+            address = ipaddress.ip_address(client_ip)
+        except ValueError:
+            return None, 900
+        if not (address.is_private or address.is_loopback or address.is_link_local):
+            return None, 900
+        now = time.monotonic()
+        with self._lock:
+            locked_until = self._locked_until.get(client_ip, 0)
+            if now < locked_until:
+                return None, max(1, int(locked_until - now))
+            if not hmac.compare_digest(self.code, candidate):
+                failures = [stamp for stamp in self._failures.get(client_ip, []) if now - stamp < 900]
+                failures.append(now)
+                self._failures[client_ip] = failures
+                if len(failures) >= 5:
+                    self._locked_until[client_ip] = now + 900
+                    return None, 900
+                return None, None
+            self._failures.pop(client_ip, None)
+            self._locked_until.pop(client_ip, None)
+            if len(self._sessions) >= 16:
+                self._sessions.clear()
+            session = secrets.token_urlsafe(32)
+            self._sessions.add(session)
+            return session, None
+
+    def authorized(self, authorization: str) -> bool:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            return False
+        with self._lock:
+            return any(hmac.compare_digest(token, active) for active in self._sessions)
+
+
 class StationHandler(BaseHTTPRequestHandler):
     """Serve station descriptors and live MP3 streams for configured slots."""
 
     server_version = "TouchSound/1.0"
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        path = urlsplit(self.path).path
+        if path in WEB_FILES:
+            filename, content_type = WEB_FILES[path]
+            try:
+                body = (WEB_ROOT / filename).read_bytes()
+            except OSError:
+                self._send(503, b"TouchSound web app is unavailable\n", "text/plain; charset=utf-8")
+                return
+            self._send(200, body, content_type)
+            return
+
+        if path == "/api/config":
+            try:
+                stations = load_stations()
+            except ValueError as exc:
+                self._send_json(500, {"error": str(exc)})
+                return
+            runtime_status = getattr(self.server, "runtime_status", None)
+            speaker = getattr(runtime_status, "speaker", "")
+            speaker_name = getattr(self.server, "speaker_name", "") or speaker
+            self._send_json(200, {
+                "speaker": {"name": speaker_name, "address": speaker},
+                "stations": [
+                    {"slot": slot, "name": stations[slot]["name"] if slot in stations else None}
+                    for slot in (str(number) for number in range(1, 7))
+                ],
+            })
+            return
+
+        if path == "/api/session":
+            access = getattr(self.server, "mobile_access", None)
+            if access is not None and access.authorized(self.headers.get("Authorization", "")):
+                self._send_json(200, {"paired": True})
+            else:
+                self._send_json(401, {"error": "Phone is not paired with TouchSound"})
+            return
+
+        if path == "/health":
             try:
                 load_stations()
             except ValueError as exc:
@@ -76,7 +194,7 @@ class StationHandler(BaseHTTPRequestHandler):
             self._send(200 if healthy else 503, b"ok\n" if healthy else b"degraded\n", "text/plain; charset=utf-8")
             return
 
-        if self.path == "/status":
+        if path == "/status":
             runtime_status = getattr(self.server, "runtime_status", None)
             if runtime_status is None:
                 self._send(200, json.dumps({"healthy": True, "relay": "running"}).encode(), "application/json; charset=utf-8")
@@ -84,7 +202,7 @@ class StationHandler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(runtime_status.snapshot(), ensure_ascii=False).encode(), "application/json; charset=utf-8")
             return
 
-        if self.path == "/events":
+        if path == "/events":
             runtime_status = getattr(self.server, "runtime_status", None)
             history = (
                 {"retentionHours": 48, "count": 0, "events": []}
@@ -93,12 +211,12 @@ class StationHandler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(history, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             return
 
-        stream_match = STREAM_PATTERN.fullmatch(urlsplit(self.path).path)
+        stream_match = STREAM_PATTERN.fullmatch(path)
         if stream_match:
             self._stream(stream_match.group(1))
             return
 
-        match = SLOT_PATTERN.fullmatch(urlsplit(self.path).path)
+        match = SLOT_PATTERN.fullmatch(path)
         if not match:
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
             return
@@ -127,13 +245,25 @@ class StationHandler(BaseHTTPRequestHandler):
         self._send(200, body, "application/json; charset=utf-8")
 
     def do_POST(self) -> None:
-        reboot_request = self.path == "/control/reboot"
-        play_match = re.fullmatch(r"/control/play/([1-6])", self.path)
-        if not reboot_request and play_match is None:
+        path = urlsplit(self.path).path
+        if path == "/api/pair":
+            self._pair_phone()
+            return
+
+        reboot_request = path == "/control/reboot"
+        play_match = re.fullmatch(r"/control/play/([1-6])", path)
+        transport_action = path.removeprefix("/control/") if path in {
+            "/control/pause", "/control/resume", "/control/stop"
+        } else None
+        volume_request = path == "/control/volume"
+        if not reboot_request and play_match is None and transport_action is None and not volume_request:
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
             return
-        if self.client_address[0] not in {"127.0.0.1", "::1"}:
-            self._send(403, b"local access only\n", "text/plain; charset=utf-8")
+        if not self._is_loopback_client() and not self._is_private_network_client():
+            self._send_json(403, {"error": "Speaker controls are available only from the local network"})
+            return
+        if not self._is_loopback_client() and not self._mobile_authorized():
+            self._send_json(401, {"error": "Pair this phone with TouchSound to control the speaker"})
             return
         if play_match is not None:
             request_play = getattr(self.server, "request_preset_play", None)
@@ -145,14 +275,103 @@ class StationHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send(502, f"preset command failed: {exc}\n".encode("utf-8"), "text/plain; charset=utf-8")
                 return
-            self._send(202, b"preset command sent\n", "text/plain; charset=utf-8")
+            self._send_json(202, {"message": "Preset command sent"})
+            return
+        if transport_action is not None:
+            request_transport = getattr(self.server, "request_transport_control", None)
+            if request_transport is None:
+                self._send_json(503, {"error": "Speaker control unavailable"})
+                return
+            try:
+                request_transport(transport_action)
+            except Exception as exc:
+                self._send_json(502, {"error": f"Speaker command failed: {exc}"})
+                return
+            self._send_json(202, {"message": f"{transport_action.title()} command sent"})
+            return
+        if volume_request:
+            request_volume = getattr(self.server, "request_volume", None)
+            if request_volume is None:
+                self._send_json(503, {"error": "Speaker control unavailable"})
+                return
+            try:
+                body = self._read_json_body()
+                volume = body.get("volume")
+                if isinstance(volume, bool) or not isinstance(volume, int) or not 0 <= volume <= 100:
+                    raise ValueError("Volume must be a whole number from 0 to 100")
+                request_volume(volume)
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except Exception as exc:
+                self._send_json(502, {"error": f"Speaker volume command failed: {exc}"})
+                return
+            self._send_json(202, {"message": "Volume command sent"})
             return
         request_reboot = getattr(self.server, "request_speaker_reboot", None)
         if request_reboot is None:
             self._send(503, b"speaker control unavailable\n", "text/plain; charset=utf-8")
             return
         request_reboot()
-        self._send(202, b"speaker restart queued\n", "text/plain; charset=utf-8")
+        self._send_json(202, {"message": "Speaker restart queued"})
+
+    def _pair_phone(self) -> None:
+        access = getattr(self.server, "mobile_access", None)
+        if access is None:
+            self._send_json(503, {"error": "Phone pairing is unavailable"})
+            return
+        if not self._is_loopback_client() and not self._is_private_network_client():
+            self._send_json(403, {"error": "Phone pairing is available only from the local network"})
+            return
+        try:
+            body = self._read_json_body()
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        code = body.get("code")
+        if not isinstance(code, str):
+            self._send_json(400, {"error": "Enter the 12-digit pairing code"})
+            return
+        session, retry_after = access.pair(self.client_address[0], code.strip())
+        if session is None:
+            if retry_after is not None:
+                self._send_json(429, {"error": "Too many attempts. Try again in 15 minutes."})
+            else:
+                self._send_json(403, {"error": "That pairing code did not match"})
+            return
+        self._send_json(200, {"token": session})
+
+    def _read_json_body(self) -> dict[str, object]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Invalid request length") from exc
+        if length <= 0 or length > 4096:
+            raise ValueError("Request body must be between 1 and 4096 bytes")
+        try:
+            parsed = json.loads(self.rfile.read(length))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Request body must contain valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("Request body must be a JSON object")
+        return parsed
+
+    def _is_loopback_client(self) -> bool:
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            return False
+
+    def _is_private_network_client(self) -> bool:
+        try:
+            address = ipaddress.ip_address(self.client_address[0])
+            return address.is_private or address.is_link_local
+        except ValueError:
+            return False
+
+    def _mobile_authorized(self) -> bool:
+        access = getattr(self.server, "mobile_access", None)
+        return access is not None and access.authorized(self.headers.get("Authorization", ""))
 
     def _stream(self, slot: str) -> None:
         """Relay one upstream source as MP3, stopping FFmpeg on disconnect."""
@@ -222,8 +441,19 @@ class StationHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        )
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_json(self, status: int, value: object) -> None:
+        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._send(status, body, "application/json; charset=utf-8")
 
     def log_message(self, fmt: str, *args: object) -> None:
         if not self.path.startswith("/stream/"):

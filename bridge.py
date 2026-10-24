@@ -17,7 +17,7 @@ from pathlib import Path
 
 import websocket
 
-from server import StationHandler, load_stations
+from server import MobileAccess, StationHandler, load_stations
 from runtime import RuntimeStatus, SpeakerSupervisor
 
 
@@ -107,6 +107,7 @@ class PresetBridge:
         self.stations = stations
         self.status = status
         self.reconnect_delay = 1
+        self._control_lock = threading.RLock()
 
     def play_preset(self, slot: str) -> None:
         """Ask the speaker to play the local relay URL for ``slot``."""
@@ -115,20 +116,53 @@ class PresetBridge:
             print(f"Preset {slot} has no station configured", file=sys.stderr)
             return
         url = f"{self.relay_url}/stream/{slot}"
-        print(f"Preset {slot}: playing {station['name']}", flush=True)
-        self.status.record_command("play_preset", slot=slot, station=station["name"])
-        self.status.play_command_started()
-        metadata = make_didl(station["name"], url)
-        try:
-            soap_request(self.speaker, "SetAVTransportURI", {
-                "InstanceID": "0",
-                "CurrentURI": url,
-                "CurrentURIMetaData": metadata,
-            })
-            soap_request(self.speaker, "Play", {"InstanceID": "0", "Speed": "1"})
-        except Exception as exc:
-            self.status.playback_error(str(exc))
-            raise
+        with self._control_lock:
+            print(f"Preset {slot}: playing {station['name']}", flush=True)
+            self.status.record_command("play_preset", slot=slot, station=station["name"])
+            self.status.play_command_started()
+            metadata = make_didl(station["name"], url)
+            try:
+                soap_request(self.speaker, "SetAVTransportURI", {
+                    "InstanceID": "0",
+                    "CurrentURI": url,
+                    "CurrentURIMetaData": metadata,
+                })
+                soap_request(self.speaker, "Play", {"InstanceID": "0", "Speed": "1"})
+            except Exception as exc:
+                self.status.playback_error(str(exc))
+                raise
+
+    def control_transport(self, action: str) -> None:
+        """Send a supported transport command from the mobile controller."""
+        if action not in {"pause", "resume", "stop"}:
+            raise ValueError(f"Unsupported transport command: {action}")
+        with self._control_lock:
+            self.status.record_command(f"mobile_{action}_playback")
+            if action in {"pause", "stop"}:
+                self.status.clear_expected_preset(f"Playback monitoring paused after mobile {action}")
+            soap_action = {"pause": "Pause", "resume": "Play", "stop": "Stop"}[action]
+            arguments = {"InstanceID": "0"}
+            if action == "resume":
+                arguments["Speed"] = "1"
+            soap_request(self.speaker, soap_action, arguments)
+
+    def set_volume(self, value: int) -> None:
+        """Set the speaker volume through its local SoundTouch HTTP API."""
+        payload = f"<volume>{value}</volume>".encode("utf-8")
+        request = urllib.request.Request(
+            f"http://{self.speaker}:8090/volume",
+            data=payload,
+            headers={"Content-Type": "application/xml; charset=utf-8"},
+            method="POST",
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with self._control_lock:
+            try:
+                with opener.open(request, timeout=4) as response:
+                    response.read()
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise RuntimeError(f"Could not set speaker volume: {exc}") from exc
+            self.status.record_command("mobile_set_volume", volume=value)
 
     def on_message(self, _ws: websocket.WebSocketApp, message: str) -> None:
         self.status.websocket_message()
@@ -180,6 +214,7 @@ class PresetBridge:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--speaker", required=True, help="SoundTouch IP or hostname")
+    parser.add_argument("--speaker-name", help="Friendly name shown in the mobile web app")
     parser.add_argument("--relay-url", help="LAN URL the speaker can reach; derived from the route to the speaker if omitted")
     parser.add_argument("--bind", default="0.0.0.0", help="Address for the local audio relay (default: all LAN interfaces)")
     parser.add_argument("--port", type=int, default=8765, help="Local relay port (default: 8765)")
@@ -187,6 +222,11 @@ def main() -> None:
     parser.add_argument("--reboot-cooldown", type=int, default=1800, help="Minimum seconds between automatic reboots (default: 1800)")
     parser.add_argument("--state-file", help="Path for persisted supervisor cooldown state")
     parser.add_argument("--event-log", help="Path for the 48-hour speaker state history")
+    parser.add_argument(
+        "--control-token-file",
+        default=str(Path.home() / ".touchsound" / "mobile-control.token"),
+        help="Private file containing the 12-digit phone pairing code",
+    )
     parser.add_argument("--no-auto-reboot", action="store_true", help="Report faults and retry playback without rebooting the speaker")
     args = parser.parse_args()
 
@@ -211,6 +251,11 @@ def main() -> None:
         event_log=Path(args.event_log).expanduser() if args.event_log else None,
     )
     server.runtime_status = status
+    server.speaker_name = args.speaker_name or args.speaker
+    try:
+        server.mobile_access = MobileAccess(Path(args.control_token_file))
+    except (OSError, ValueError) as exc:
+        parser.error(f"Cannot initialize mobile phone access: {exc}")
 
     bridge = PresetBridge(args.speaker, relay_url, stations, status)
 
@@ -234,6 +279,8 @@ def main() -> None:
     )
     server.request_speaker_reboot = supervisor.request_manual_reboot
     server.request_preset_play = request_preset_play
+    server.request_transport_control = bridge.control_transport
+    server.request_volume = bridge.set_volume
 
     relay_stop = threading.Event()
 

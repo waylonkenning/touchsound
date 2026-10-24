@@ -48,6 +48,8 @@ Replace both example addresses with your speaker and Mac's LAN addresses. The re
 
 The menu bar app shows whether the listener is connected, whether the speaker responds, the transport playback state, and whether stream data is arriving. It discovers SoundTouch speakers on the local network with Bonjour; choose one from the **SoundTouch Speakers** menu to switch the bridge to that device. It can also start, stop, or restart the bridge, request a speaker restart, and open the service log. The speaker restart action asks for confirmation first.
 
+TouchSound also serves a mobile web controller at the bridge URL. Choose **Open Phone Web App** from the menu bar to open it on the Mac and copy the 12-digit pairing code. On your phone, open the same `http://<Mac-LAN-address>:8765` address, enter the code, then use Safari's **Share → Add to Home Screen** if you want an app-style shortcut. The phone can see bridge and speaker status, play any configured preset, pause/resume/stop playback, adjust volume, and review recent speaker activity. On iPhone, the compact first view keeps playback controls and all six presets together; tap **Speaker activity** to expand the 48-hour log. Pairing sessions end when the bridge restarts; use the Mac menu or `./.venv/bin/python service.py mobile-code` to pair again.
+
 To remove the login services and menu bar app while keeping configuration and logs, run:
 
 ```sh
@@ -69,7 +71,7 @@ curl -i http://<bridge-host-ip>:8765/health
 
 `/status` returns bridge, speaker, playback, stream, and recovery details. `/health` returns `ok` only when the WebSocket and speaker respond and, during managed playback, the expected stream is active. The monitor can verify the digital stream path; it cannot detect whether the speaker's physical amplifier is producing audible sound.
 
-On macOS, the menu bar app runs as a LaunchAgent under the logged-in user and owns the supervised bridge process. launchd relaunches the app at login or after an app crash; the app restarts the watchdog if it exits; the watchdog restarts the bridge if that process exits. The menu bar app polls `/status` every five seconds and checks speaker TCP reachability. A manual speaker restart goes through a loopback-only bridge endpoint, so it is not exposed to other devices on the LAN.
+On macOS, the menu bar app runs as a LaunchAgent under the logged-in user and owns the supervised bridge process. launchd relaunches the app at login or after an app crash; the app restarts the watchdog if it exits; the watchdog restarts the bridge if that process exits. The menu bar app polls `/status` every five seconds and checks speaker TCP reachability. The menu bar app can restart the speaker through loopback; phone access uses a paired session.
 
 ```sh
 ./.venv/bin/python service.py status
@@ -137,7 +139,7 @@ See [Troubleshooting](docs/TROUBLESHOOTING.md) for connection checks and common 
 - Wrong relay address: set `--relay-url` to a LAN URL the speaker can reach.
 - macOS reports no speaker response from the login agent: open **System Settings → Privacy & Security → Local Network** and enable **TouchSound**. Then use **Restart Bridge** in its menu bar menu.
 
-The relay has no authentication and is intended for a trusted home LAN. Do not forward port `8765` to the public internet.
+The stream relay and read-only status/history endpoints are available to devices on the LAN. Phone playback and volume controls require the pairing code. Keep port `8765` on a trusted home LAN and do not forward it to the public internet.
 
 ## Related work and references
 

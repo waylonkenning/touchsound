@@ -31,7 +31,11 @@ The `nowSelectionUpdated` event is parsed as XML. A recognized preset id selects
 
 `runtime.py` checks the SoundTouch HTTP API and UPnP transport every 15 seconds. During a managed preset, it compares the current transport URI and state with the expected relay URL and tracks bytes sent to the speaker. If the stream stalls, it reissues the preset once, then tries a speaker reboot after further failed checks. If the speaker API is unreachable for three checks, it attempts a reboot directly. Automatic reboots have a 30-minute cooldown; after reboot, the supervisor waits for the speaker to return and replays the last preset. A manual pause or input change clears the active playback expectation. The bridge writes state transitions, preset selections, monitor decisions, and playback/reboot commands to a JSONL history and removes entries older than 48 hours. State changes without a recent bridge command are labelled as external or automatic standby, since the speaker API cannot identify which controller caused them.
 
-The macOS menu bar app polls `/status` every five seconds and also checks whether the speaker accepts TCP connections. It browses Bonjour service `_soundtouch._tcp` in the local domain and resolves each result to its reachable host address. Choose a discovered device from the **SoundTouch Speakers** submenu to save it as the active speaker and restart the bridge service. The app starts `service.py run` as a child process and restarts that process if it exits. The watchdog restarts `bridge.py` if the bridge process exits. `launchd` starts the menu app at login and relaunches it if it exits. The menu exposes bridge and speaker status, bridge start/stop/restart controls, a speaker restart action, the service log, and the 48-hour speaker history. A requested speaker restart is sent to the loopback-only `/control/reboot` endpoint and queued on the supervisor thread, which records the reboot time and observes the normal recovery cooldown. This lets the app helper perform speaker network access under the app's macOS Local Network permission.
+The macOS menu bar app polls `/status` every five seconds and also checks whether the speaker accepts TCP connections. It browses Bonjour service `_soundtouch._tcp` in the local domain and resolves each result to its reachable host address. Choose a discovered device from the **SoundTouch Speakers** submenu to save it as the active speaker and restart the bridge service. The app starts `service.py run` as a child process and restarts that process if it exits. The watchdog restarts `bridge.py` if the bridge process exits. `launchd` starts the menu app at login and relaunches it if it exits. The menu exposes bridge and speaker status, bridge start/stop/restart controls, a speaker restart action, the service log, the 48-hour speaker history, and the mobile web app. A requested speaker restart is sent to `/control/reboot` and queued on the supervisor thread, which records the reboot time and observes the normal recovery cooldown. Loopback requests from the menu app remain allowed; phone requests need a paired bearer token.
+
+The mobile web app is static HTML, CSS, and JavaScript served by the bridge at `/`. It polls `/status` and `/events`, reads preset names from `/api/config`, and sends commands to the same origin. Pairing exchanges a 12-digit code from the owner-only `mobile-control.token` file for a random in-memory session token. Failed code attempts are rate-limited per client IP. Session tokens are cleared when the bridge process restarts. The app does not enable CORS; its control requests require an `Authorization: Bearer` header. The local HTTP endpoints still rely on the home LAN as the trust boundary, so port `8765` must not be exposed to the public internet.
+
+The phone layout prioritizes the current playback state, transport and volume controls, and all six presets. The 48-hour activity list is behind an expandable summary so it remains available without pushing the controls off a typical iPhone screen.
 
 The stream URL sent to the speaker is the relay URL, not the provider URL. The bridge therefore does not depend on the speaker understanding the upstream format. For each `/stream/<slot>` request, `server.py` runs FFmpeg with the station's source URL and writes MP3 audio to the HTTP response. When the speaker disconnects, the FFmpeg process is terminated.
 
@@ -46,8 +50,14 @@ The HTTP server listens on TCP port `8765` by default and binds to all interface
 | `/health` | Return `ok` only when the relay, event connection, and speaker are healthy |
 | `/status` | JSON health snapshot for the bridge, speaker, playback, relay, and supervisor |
 | `/events` | JSON speaker state changes and bridge commands from the last 48 hours |
-| `/control/play/1` through `/control/play/6` | Loopback-only POST that starts a configured preset |
-| `/control/reboot` | Loopback-only POST that queues a manual speaker restart on the supervisor thread |
+| `/` | Mobile web controller |
+| `/api/config` | Configured speaker label and six preset names |
+| `/api/pair` | Exchange the local pairing code for an in-memory phone session |
+| `/api/session` | Check whether a phone session is still active |
+| `/control/play/1` through `/control/play/6` | POST to start a configured preset; loopback or paired phone |
+| `/control/pause`, `/control/resume`, `/control/stop` | POST speaker transport controls; loopback or paired phone |
+| `/control/volume` | POST `{"volume":0..100}`; loopback or paired phone |
+| `/control/reboot` | POST to queue a manual speaker restart; loopback or paired phone |
 
 The bridge needs network access to speaker ports `8080` (WebSocket notifications), `8090` (SoundTouch status), and `8091` (UPnP control). Automatic reboot also uses the speaker's local diagnostic shell on port `17000`.
 
@@ -56,7 +66,7 @@ The bridge needs network access to speaker ports `8080` (WebSocket notifications
 | File | Responsibility |
 | --- | --- |
 | `bridge.py` | Connect to button events, map slots, and issue UPnP playback commands |
-| `server.py` | Serve station descriptors and FFmpeg-backed MP3 streams |
+| `server.py` | Serve the mobile web app, station descriptors, paired control endpoints, and FFmpeg-backed MP3 streams |
 | `runtime.py` | Track health, recover stalled playback or an unresponsive speaker, and maintain the rolling state history |
 | `service.py` | Run a watchdog that restarts a crashed bridge process; provide CLI status and lifecycle commands |
 | `macos/TouchSoundMenu.swift` | Native menu bar UI that supervises the bridge child and displays health and controls |

@@ -241,6 +241,11 @@ class RuntimeStatus:
             "playStatus": None,
             "trackUri": None,
             "source": None,
+            "track": None,
+            "artist": None,
+            "album": None,
+            "stationName": None,
+            "contentItemName": None,
             "volume": None,
             "muted": None,
             "error": None,
@@ -465,7 +470,9 @@ def _speaker_snapshot(speaker: str) -> dict[str, object]:
             pass
     except (urllib.error.URLError, ET.ParseError, TimeoutError, OSError) as exc:
         return {"reachable": False, "transportState": None, "playStatus": None, "trackUri": None,
-                "source": None, "volume": volume, "muted": muted, "error": str(exc)}
+                "source": None, "track": None, "artist": None, "album": None,
+                "stationName": None, "contentItemName": None,
+                "volume": volume, "muted": muted, "error": str(exc)}
 
     transport_state: str | None = None
     track_uri: str | None = None
@@ -474,7 +481,11 @@ def _speaker_snapshot(speaker: str) -> dict[str, object]:
     except (urllib.error.URLError, ET.ParseError, TimeoutError, OSError, RuntimeError) as exc:
         return {"reachable": True, "transportState": None,
                 "playStatus": now_playing.get("playStatus"), "trackUri": None,
-                "source": now_playing.get("source"), "volume": volume, "muted": muted,
+                "source": now_playing.get("source"),
+                "track": now_playing.get("track"), "artist": now_playing.get("artist"),
+                "album": now_playing.get("album"), "stationName": now_playing.get("stationName"),
+                "contentItemName": now_playing.get("itemName"),
+                "volume": volume, "muted": muted,
                 "error": f"SoundTouch API responds, but UPnP status failed: {exc}"}
     return {
         "reachable": True,
@@ -482,6 +493,11 @@ def _speaker_snapshot(speaker: str) -> dict[str, object]:
         "playStatus": now_playing.get("playStatus"),
         "trackUri": track_uri,
         "source": now_playing.get("source"),
+        "track": now_playing.get("track"),
+        "artist": now_playing.get("artist"),
+        "album": now_playing.get("album"),
+        "stationName": now_playing.get("stationName"),
+        "contentItemName": now_playing.get("itemName"),
         "volume": volume,
         "muted": muted,
         "error": None,
@@ -655,7 +671,7 @@ class SpeakerSupervisor:
         if slot is None and result.get("reachable") is True:
             track_uri = str(result.get("trackUri") or "")
             match = re.fullmatch(re.escape(self.relay_url) + r"/stream/([1-6])", track_uri)
-            if match and match.group(1) in self.stations:
+            if match and match.group(1) in self.stations and result.get("transportState") == "PLAYING":
                 slot = match.group(1)
                 station_name = self.stations[slot]["name"]
                 self.status.select_preset(slot, station_name)

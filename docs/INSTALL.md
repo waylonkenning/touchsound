@@ -39,6 +39,18 @@ The installer builds `TouchSound.app` in `~/Applications`, creates a per-user lo
 
 Click the speaker icon in the menu bar to view button-listener, speaker, playback, and stream status. Open **SoundTouch Speakers** to see devices discovered through Bonjour (`_soundtouch._tcp`). Select a device to save it as the active speaker and restart the bridge. Discovery works when the Mac and speaker share a local network that passes mDNS multicast; guest Wi-Fi or VLAN isolation can block it. The menu can also start, stop, or restart the bridge service, request a speaker restart, and open the 48-hour speaker history. The login agent stays loaded when you stop the bridge from the menu.
 
+### Open the phone controller
+
+Choose **Open Phone Web App** in the menu bar. TouchSound opens the local page on the Mac and copies a 12-digit pairing code. On the phone, join the same home Wi-Fi, open the LAN address shown in the menu alert, and enter that code. In Safari, choose **Share → Add to Home Screen** to keep an app-style shortcut. The compact iPhone view keeps playback controls and all six configured stations on one screen. Tap **Speaker activity** to expand the rolling 48-hour log.
+
+You can retrieve the code from Terminal at any time:
+
+```sh
+./.venv/bin/python service.py mobile-code
+```
+
+The code is stored in `~/Library/Application Support/TouchSound/mobile-control.token` with owner-only file permissions. A bridge restart ends paired browser sessions; the same code can pair the phone again. Phone commands use a paired bearer token. Status, station names, stream URLs, and history remain visible to devices on the LAN without pairing, so do not expose port `8765` to the internet.
+
 ### Check and manage the service
 
 Use the menu bar status or run:
@@ -75,6 +87,8 @@ docker compose up -d --build
 
 `SOUNDTOUCH_IP` is the speaker address. `RELAY_URL` must use the Docker host's LAN address and published port `8765`; the speaker cannot use the container's private address. Compose publishes the relay port, restarts the container if it exits, and keeps the event history in its named `touchsound_data` volume.
 
+Open `http://<Docker-host-LAN-address>:8765` on a phone on the same Wi-Fi network. Retrieve its pairing code with `docker compose exec touchsound cat /data/mobile-control.token`, then enter it in the page. The token file stays in the Compose volume.
+
 Check playback and logs:
 
 ```sh
@@ -99,4 +113,4 @@ Omit `--relay-url` to let TouchSound select the local address routed to the spea
 
 Use direct, publicly reachable radio stream URLs. Station web pages, streams requiring login, and URLs that include credentials are not supported. Providers can change stream URLs or apply regional restrictions.
 
-The relay has no authentication. Keep it on a trusted home network and do not forward port `8765` to the public internet. Health checks confirm that the speaker renderer is receiving data; they cannot confirm audible output from the physical speaker.
+The stream relay and read-only status/history endpoints are available to devices on the LAN. Phone playback and volume commands require the pairing code. Keep the bridge on a trusted home network and do not forward port `8765` to the public internet. Health checks confirm that the speaker renderer is receiving data; they cannot confirm audible output from the physical speaker.

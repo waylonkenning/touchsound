@@ -9,6 +9,7 @@ COPY bridge.py /app/bridge.py
 COPY runtime.py /app/runtime.py
 COPY stations.json /app/stations.json
 COPY requirements.txt /app/requirements.txt
+COPY web /app/web
 RUN pip install --no-cache-dir -r /app/requirements.txt
 EXPOSE 8765
 CMD ["python", "/app/bridge.py"]
