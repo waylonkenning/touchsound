@@ -96,6 +96,7 @@ def install(args: argparse.Namespace) -> None:
     uid = os.getuid()
     domain = f"gui/{uid}"
     state_file = SUPPORT / "runtime.json"
+    event_log = SUPPORT / "speaker-history.jsonl"
     LOGS.mkdir(parents=True, exist_ok=True)
     SUPPORT.mkdir(parents=True, exist_ok=True)
     APPLICATIONS.mkdir(parents=True, exist_ok=True)
@@ -108,6 +109,7 @@ def install(args: argparse.Namespace) -> None:
         "pythonPath": str(python),
         "servicePath": str(PROJECT / "service.py"),
         "bridgeLabel": BRIDGE_LABEL,
+        "eventLogPath": str(event_log),
     }
     try:
         previous_config = json.loads((SUPPORT / "config.json").read_text(encoding="utf-8"))

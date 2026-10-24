@@ -61,6 +61,16 @@ curl http://<bridge-host-ip>:8765/radio/1.json
 
 The supervisor checks every 15 seconds. It retries the active preset before attempting a reboot and will not reboot more than once per 30 minutes. It does not intervene after a manual pause or input change. If `/status` shows the speaker API responding but the relay has no recent bytes, check the upstream station URL and FFmpeg before suspecting the speaker. The health check cannot measure sound from the physical speaker.
 
+## Speaker unexpectedly enters standby
+
+Review the recent state history in the menu bar app or with:
+
+```sh
+curl http://127.0.0.1:8765/events
+```
+
+The history records transport, source, reachability, mute and volume changes, plus TouchSound commands. A change labelled “no recent TouchSound command” means the bridge did not issue a nearby command; the speaker does not report whether the cause was its standby timer, its controls, or another app. Compare the transition time with `lastStreamBytesAt` in `/status`. If the stream stopped first, the speaker may have gone to standby after losing audio. Bose's [SoundTouch 20 Series III owner guide](https://assets.bose.com/content/dam/Bose_DAM/Web/consumer_electronics/global/products/speakers/soundtouch_20_seriesiii_wireless_music_system/pdf/801086_og_soundtouch-20-wireless-music-system-bundle_en.pdf) lists automatic entry into networked standby within 20 minutes; this is a possible explanation, not proof of what triggered a particular stop.
+
 ## Check speaker status
 
 The read-only status command uses the SoundTouch HTTP API on port `8090`. The health supervisor also uses this port to inspect the active source and volume:

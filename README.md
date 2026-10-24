@@ -58,6 +58,8 @@ python3 macos/install.py uninstall
 
 The bridge checks itself and the speaker every 15 seconds. It verifies the SoundTouch API and UPnP transport state. While a preset is active, it also checks that the speaker is playing the expected relay URL and is receiving stream bytes. It retries the preset once before attempting a speaker reboot. Reboots are limited to one attempt every 30 minutes. A manual pause or switch to another input stops playback recovery.
 
+TouchSound keeps a rolling 48-hour speaker history. It records speaker state changes, preset selections, and bridge commands, with timestamps and an indication of whether a change followed a recent TouchSound command. A change with no recent bridge command could come from a speaker control, another controller, or automatic standby; the log cannot identify which one. On macOS, choose **Open Speaker History (48 h)** in the menu bar app. The history is also available at `/events` and is stored at `~/Library/Application Support/TouchSound/speaker-history.jsonl`.
+
 Inspect the current checks from a browser or terminal:
 
 ```sh
@@ -73,7 +75,7 @@ On macOS, the menu bar app runs as a LaunchAgent under the logged-in user and ow
 ./.venv/bin/python service.py status
 ```
 
-Use `./.venv/bin/python service.py status` to inspect the bridge, or use the menu bar app to stop, start, or restart the bridge service. The login agent remains loaded so the menu bar app can continue to run. Logs are written to `~/Library/Logs/TouchSound/service.log`; configuration and the persisted reboot cooldown are under `~/Library/Application Support/TouchSound`. Automatic speaker recovery and the manual restart control use the speaker's local diagnostic shell on TCP port `17000`, which is not part of Bose's documented Web API. Keep the speaker and bridge on a trusted home network.
+Use `./.venv/bin/python service.py status` to inspect the bridge, or use the menu bar app to stop, start, or restart the bridge service. The login agent remains loaded so the menu bar app can continue to run. Service logs are written to `~/Library/Logs/TouchSound/service.log`; the rolling speaker history, configuration, and persisted reboot cooldown are under `~/Library/Application Support/TouchSound`. Automatic speaker recovery and the manual restart control use the speaker's local diagnostic shell on TCP port `17000`, which is not part of Bose's documented Web API. Keep the speaker and bridge on a trusted home network.
 
 ## Run with Docker Compose
 
@@ -87,7 +89,7 @@ docker compose up -d --build
 
 Replace the example addresses. The speaker must be able to reach the Docker host at `RELAY_URL`. View logs with `docker compose logs -f`; stop the service with `docker compose down`.
 
-The Docker image includes the same health supervisor as the macOS setup. It also needs network access to the speaker's local diagnostic port `17000` for automatic speaker recovery. Append `--no-auto-reboot` to the `command` list in `compose.yaml` if you want playback retries without automatic speaker restarts.
+The Docker image includes the same health supervisor and 48-hour speaker history as the macOS setup. The Compose volume keeps history across container recreation. It also needs network access to the speaker's local diagnostic port `17000` for automatic speaker recovery. Append `--no-auto-reboot` to the `command` list in `compose.yaml` if you want playback retries without automatic speaker restarts.
 
 ## Station configuration
 

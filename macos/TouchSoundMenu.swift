@@ -25,6 +25,7 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let restartItem = NSMenuItem(title: "Restart Bridge", action: #selector(restartBridge), keyEquivalent: "")
     private let cycleSpeakerItem = NSMenuItem(title: "Restart SoundTouch Speaker…", action: #selector(cycleSpeaker), keyEquivalent: "")
     private let logItem = NSMenuItem(title: "Open Service Log", action: #selector(openLog), keyEquivalent: "")
+    private let historyItem = NSMenuItem(title: "Open Speaker History (48 h)", action: #selector(openSpeakerHistory), keyEquivalent: "")
 
     private var latestStatus: [String: Any] = [:]
     private var config: [String: Any] = [:]
@@ -115,6 +116,9 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logItem.target = self
         logItem.action = #selector(openLog)
         menu.addItem(logItem)
+        historyItem.target = self
+        historyItem.action = #selector(openSpeakerHistory)
+        menu.addItem(historyItem)
         let refresh = NSMenuItem(title: "Refresh Status", action: #selector(refreshNow), keyEquivalent: "")
         refresh.target = self
         menu.addItem(refresh)
@@ -506,6 +510,9 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let relayURL = self.config["relayURL"] as? String, !relayURL.isEmpty {
                     arguments += ["--relay-url", relayURL]
                 }
+                if let eventLogPath = self.config["eventLogPath"] as? String, !eventLogPath.isEmpty {
+                    arguments += ["--event-log", eventLogPath]
+                }
                 process.arguments = arguments
                 process.environment = [
                     "PYTHONUNBUFFERED": "1",
@@ -584,6 +591,13 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let log = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/TouchSound/service.log")
         NSWorkspace.shared.open(log)
+    }
+
+    @objc private func openSpeakerHistory() {
+        let path = config["eventLogPath"] as? String
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/TouchSound/speaker-history.jsonl").path
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
 }

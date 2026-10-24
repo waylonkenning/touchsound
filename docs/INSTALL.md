@@ -37,7 +37,7 @@ Replace the example addresses with the speaker's IP address and the Mac's LAN ad
 
 The installer builds `TouchSound.app` in `~/Applications`, creates a per-user login agent, and starts the menu bar app. When macOS asks, allow TouchSound to access the local network. You can review that setting under **System Settings → Privacy & Security → Local Network**.
 
-Click the speaker icon in the menu bar to view button-listener, speaker, playback, and stream status. Open **SoundTouch Speakers** to see devices discovered through Bonjour (`_soundtouch._tcp`). Select a device to save it as the active speaker and restart the bridge. Discovery works when the Mac and speaker share a local network that passes mDNS multicast; guest Wi-Fi or VLAN isolation can block it. The menu can also start, stop, or restart the bridge service and request a speaker restart. The login agent stays loaded when you stop the bridge from the menu.
+Click the speaker icon in the menu bar to view button-listener, speaker, playback, and stream status. Open **SoundTouch Speakers** to see devices discovered through Bonjour (`_soundtouch._tcp`). Select a device to save it as the active speaker and restart the bridge. Discovery works when the Mac and speaker share a local network that passes mDNS multicast; guest Wi-Fi or VLAN isolation can block it. The menu can also start, stop, or restart the bridge service, request a speaker restart, and open the 48-hour speaker history. The login agent stays loaded when you stop the bridge from the menu.
 
 ### Check and manage the service
 
@@ -49,7 +49,7 @@ curl http://127.0.0.1:8765/status
 curl -i http://127.0.0.1:8765/health
 ```
 
-Logs are in `~/Library/Logs/TouchSound/`. The service configuration and reboot cooldown state are in `~/Library/Application Support/TouchSound/`. Keep the Mac awake and permit incoming connections on TCP port `8765` while using the presets.
+Service logs are in `~/Library/Logs/TouchSound/`. The 48-hour state-change history is `~/Library/Application Support/TouchSound/speaker-history.jsonl`; fetch the same history as JSON from `http://127.0.0.1:8765/events`. Configuration and reboot cooldown state are also in `~/Library/Application Support/TouchSound/`. Keep the Mac awake and permit incoming connections on TCP port `8765` while using the presets.
 
 After editing `stations.json`, select **Restart Bridge** from the menu bar menu. To update the app after pulling new source code, rerun the installer with the same speaker address:
 
@@ -73,12 +73,13 @@ RELAY_URL=http://192.168.1.50:8765 \
 docker compose up -d --build
 ```
 
-`SOUNDTOUCH_IP` is the speaker address. `RELAY_URL` must use the Docker host's LAN address and published port `8765`; the speaker cannot use the container's private address. The Compose file publishes the relay port and restarts the container if it exits.
+`SOUNDTOUCH_IP` is the speaker address. `RELAY_URL` must use the Docker host's LAN address and published port `8765`; the speaker cannot use the container's private address. Compose publishes the relay port, restarts the container if it exits, and keeps the event history in its named `touchsound_data` volume.
 
 Check playback and logs:
 
 ```sh
 curl http://192.168.1.50:8765/status
+curl http://192.168.1.50:8765/events
 docker compose logs -f
 ```
 

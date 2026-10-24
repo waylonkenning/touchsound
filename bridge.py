@@ -116,6 +116,7 @@ class PresetBridge:
             return
         url = f"{self.relay_url}/stream/{slot}"
         print(f"Preset {slot}: playing {station['name']}", flush=True)
+        self.status.record_command("play_preset", slot=slot, station=station["name"])
         self.status.play_command_started()
         metadata = make_didl(station["name"], url)
         try:
@@ -137,6 +138,7 @@ class PresetBridge:
         station = self.stations.get(slot)
         if station is not None:
             self.status.select_preset(slot, station["name"])
+            self.status.record_event("speaker_preset_selected", slot=slot, station=station["name"])
         try:
             self.play_preset(slot)
         except Exception as exc:
@@ -184,6 +186,7 @@ def main() -> None:
     parser.add_argument("--monitor-interval", type=int, default=15, help="Seconds between speaker health checks (default: 15)")
     parser.add_argument("--reboot-cooldown", type=int, default=1800, help="Minimum seconds between automatic reboots (default: 1800)")
     parser.add_argument("--state-file", help="Path for persisted supervisor cooldown state")
+    parser.add_argument("--event-log", help="Path for the 48-hour speaker state history")
     parser.add_argument("--no-auto-reboot", action="store_true", help="Report faults and retry playback without rebooting the speaker")
     args = parser.parse_args()
 
@@ -202,10 +205,22 @@ def main() -> None:
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
 
-    status = RuntimeStatus(args.speaker, relay_url)
+    status = RuntimeStatus(
+        args.speaker,
+        relay_url,
+        event_log=Path(args.event_log).expanduser() if args.event_log else None,
+    )
     server.runtime_status = status
 
     bridge = PresetBridge(args.speaker, relay_url, stations, status)
+
+    def request_preset_play(slot: str) -> None:
+        station = stations.get(slot)
+        if station is None:
+            raise ValueError(f"Preset {slot} is not configured")
+        status.select_preset(slot, station["name"])
+        bridge.play_preset(slot)
+
     supervisor = SpeakerSupervisor(
         args.speaker,
         relay_url,
@@ -218,6 +233,7 @@ def main() -> None:
         state_file=Path(args.state_file).expanduser() if args.state_file else None,
     )
     server.request_speaker_reboot = supervisor.request_manual_reboot
+    server.request_preset_play = request_preset_play
 
     relay_stop = threading.Event()
 

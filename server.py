@@ -84,6 +84,15 @@ class StationHandler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(runtime_status.snapshot(), ensure_ascii=False).encode(), "application/json; charset=utf-8")
             return
 
+        if self.path == "/events":
+            runtime_status = getattr(self.server, "runtime_status", None)
+            history = (
+                {"retentionHours": 48, "count": 0, "events": []}
+                if runtime_status is None else runtime_status.event_history.recent()
+            )
+            self._send(200, json.dumps(history, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
         stream_match = STREAM_PATTERN.fullmatch(urlsplit(self.path).path)
         if stream_match:
             self._stream(stream_match.group(1))
@@ -118,11 +127,25 @@ class StationHandler(BaseHTTPRequestHandler):
         self._send(200, body, "application/json; charset=utf-8")
 
     def do_POST(self) -> None:
-        if self.path != "/control/reboot":
+        reboot_request = self.path == "/control/reboot"
+        play_match = re.fullmatch(r"/control/play/([1-6])", self.path)
+        if not reboot_request and play_match is None:
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
             return
         if self.client_address[0] not in {"127.0.0.1", "::1"}:
             self._send(403, b"local access only\n", "text/plain; charset=utf-8")
+            return
+        if play_match is not None:
+            request_play = getattr(self.server, "request_preset_play", None)
+            if request_play is None:
+                self._send(503, b"speaker control unavailable\n", "text/plain; charset=utf-8")
+                return
+            try:
+                request_play(play_match.group(1))
+            except Exception as exc:
+                self._send(502, f"preset command failed: {exc}\n".encode("utf-8"), "text/plain; charset=utf-8")
+                return
+            self._send(202, b"preset command sent\n", "text/plain; charset=utf-8")
             return
         request_reboot = getattr(self.server, "request_speaker_reboot", None)
         if request_reboot is None:

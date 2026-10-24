@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 
 def _utc(timestamp: float | None) -> str | None:
@@ -32,12 +33,191 @@ def _local_open(url_or_request: str | urllib.request.Request, timeout: int):
     return opener.open(url_or_request, timeout=timeout)
 
 
+class SpeakerEventHistory:
+    """Keep a small, time-bounded record of speaker state changes and bridge commands."""
+
+    RETENTION_SECONDS = 48 * 60 * 60
+    STATE_EVENT_TYPES = {"speaker_state_initial", "speaker_state_changed"}
+
+    def __init__(self, path: Path, relay_url: str) -> None:
+        self.path = path.expanduser()
+        self.relay_url = relay_url.rstrip("/")
+        self._lock = threading.RLock()
+        self._events: list[dict[str, object]] = []
+        self._last_state: dict[str, object] | None = None
+        self._last_state_at: float | None = None
+        self._last_command: dict[str, object] | None = None
+        self._load()
+
+    @staticmethod
+    def _event_time(event: dict[str, object]) -> float | None:
+        at = event.get("at")
+        if not isinstance(at, str):
+            return None
+        try:
+            return datetime.fromisoformat(at).timestamp()
+        except ValueError:
+            return None
+
+    def _load(self) -> None:
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and self._event_time(event) is not None:
+                self._events.append(event)
+        with self._lock:
+            self._prune_locked(time.time())
+            self._restore_markers_locked()
+            self._write_locked()
+
+    def _restore_markers_locked(self) -> None:
+        self._last_state = None
+        self._last_state_at = None
+        self._last_command = None
+        for event in self._events:
+            event_time = self._event_time(event)
+            if event_time is None:
+                continue
+            if event.get("type") in self.STATE_EVENT_TYPES and isinstance(event.get("state"), dict):
+                self._last_state = event["state"]
+                self._last_state_at = event_time
+            elif event.get("type") == "touchsound_command":
+                self._last_command = {**event, "_epoch": event_time}
+
+    def _prune_locked(self, now: float) -> bool:
+        cutoff = now - self.RETENTION_SECONDS
+        previous_count = len(self._events)
+        self._events = [
+            event for event in self._events
+            if (event_time := self._event_time(event)) is not None and event_time >= cutoff
+        ]
+        self._restore_markers_locked()
+        return len(self._events) != previous_count
+
+    def _write_locked(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            content = "".join(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n" for event in self._events)
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(self.path)
+        except OSError:
+            # A logging failure must not interrupt speaker playback or health checks.
+            pass
+
+    def record(self, event_type: str, **details: object) -> None:
+        now = time.time()
+        event = {"at": _utc(now), "type": event_type, **details}
+        with self._lock:
+            self._prune_locked(now)
+            self._events.append(event)
+            self._prune_locked(now)
+            self._write_locked()
+
+    def command(self, action: str, **details: object) -> None:
+        self.record("touchsound_command", action=action, **details)
+
+    def _safe_track(self, uri: object) -> str | None:
+        value = str(uri or "")
+        if not value:
+            return None
+        match = re.fullmatch(re.escape(self.relay_url) + r"/stream/([1-6])", value)
+        if match:
+            return f"TouchSound preset {match.group(1)}"
+        if value == "http://invalidHost.com/invalidUri.mp3":
+            return "speaker standby placeholder"
+        parsed = urlsplit(value)
+        if parsed.scheme and parsed.hostname:
+            return f"{parsed.scheme}://{parsed.hostname}"
+        return "other URI"
+
+    def observe(self, speaker: dict[str, object], expected_slot: str | None, station: str | None) -> None:
+        now = time.time()
+        state: dict[str, object] = {
+            "reachable": speaker.get("reachable"),
+            "transportState": speaker.get("transportState"),
+            "source": speaker.get("source"),
+            "track": self._safe_track(speaker.get("trackUri")),
+            "volume": speaker.get("volume"),
+            "muted": speaker.get("muted"),
+        }
+        with self._lock:
+            pruned = self._prune_locked(now)
+            previous = self._last_state
+            if previous is None:
+                event_type = "speaker_state_initial"
+                changes: dict[str, object] = {}
+                attribution = "initial observation"
+            else:
+                changes = {
+                    key: {"from": previous.get(key), "to": value}
+                    for key, value in state.items()
+                    if previous.get(key) != value
+                }
+                if not changes:
+                    if pruned:
+                        self._write_locked()
+                    return
+                event_type = "speaker_state_changed"
+                command_epoch = float(self._last_command.get("_epoch", 0)) if self._last_command else 0
+                after_last_observation = self._last_state_at is not None and command_epoch > self._last_state_at
+                recent_command = after_last_observation and now - command_epoch <= 120
+                attribution = (
+                    "after TouchSound command" if recent_command
+                    else "no recent TouchSound command; external action or automatic standby"
+                )
+            event: dict[str, object] = {
+                "at": _utc(now),
+                "type": event_type,
+                "attribution": attribution,
+                "changes": changes,
+                "state": state,
+                "expectedPreset": expected_slot,
+                "station": station,
+            }
+            if attribution == "after TouchSound command" and self._last_command is not None:
+                event["relatedCommand"] = {
+                    "action": self._last_command.get("action"),
+                    "slot": self._last_command.get("slot"),
+                    "station": self._last_command.get("station"),
+                }
+            self._last_state = state
+            self._last_state_at = now
+            self._events.append(event)
+            self._prune_locked(now)
+            self._write_locked()
+
+    def recent(self) -> dict[str, object]:
+        with self._lock:
+            self._prune_locked(time.time())
+            self._write_locked()
+            return {
+                "retentionHours": 48,
+                "count": len(self._events),
+                "events": [dict(event) for event in self._events],
+            }
+
+    def count(self) -> int:
+        with self._lock:
+            self._prune_locked(time.time())
+            return len(self._events)
+
+
 class RuntimeStatus:
     """Thread-safe status shared by the bridge, relay, and supervisor."""
 
-    def __init__(self, speaker: str, relay_url: str) -> None:
+    def __init__(self, speaker: str, relay_url: str, event_log: Path | None = None) -> None:
         self.speaker = speaker
         self.relay_url = relay_url.rstrip("/")
+        self.event_history = SpeakerEventHistory(
+            event_log or (Path.home() / ".touchsound" / "speaker-history.jsonl"), self.relay_url
+        )
         self._speaker_ips = {speaker}
         try:
             self._speaker_ips.update(item[4][0] for item in socket.getaddrinfo(speaker, None, type=socket.SOCK_STREAM))
@@ -113,6 +293,13 @@ class RuntimeStatus:
             self._supervisor["lastAction"] = reason
             self._supervisor["lastActionAt"] = time.time()
             self._supervisor["consecutiveFailures"] = 0
+        self.event_history.record("monitor_decision", action="clear_expected_preset", reason=reason)
+
+    def record_command(self, action: str, **details: object) -> None:
+        self.event_history.command(action, **details)
+
+    def record_event(self, event_type: str, **details: object) -> None:
+        self.event_history.record(event_type, **details)
 
     def play_command_started(self) -> None:
         with self._lock:
@@ -126,6 +313,9 @@ class RuntimeStatus:
     def speaker_check(self, result: dict[str, object]) -> None:
         with self._lock:
             self._speaker = {**result, "checkedAt": time.time()}
+            slot = self._expected_slot
+            station = self._station_name
+        self.event_history.observe(result, slot, station)
 
     def stream_started(self, stream_id: str, slot: str, client_ip: str) -> None:
         with self._lock:
@@ -243,6 +433,10 @@ class RuntimeStatus:
                     "lastCheckAt": _utc(self._supervisor.get("lastCheckAt")),
                     "lastActionAt": _utc(self._supervisor.get("lastActionAt")),
                     "lastRebootAttemptAt": _utc(self._supervisor.get("lastRebootAttemptAt")),
+                },
+                "eventHistory": {
+                    "retentionHours": 48,
+                    "count": self.event_history.count(),
                 },
             }
 
@@ -441,8 +635,10 @@ class SpeakerSupervisor:
         try:
             reply = _telnet_reboot(self.speaker)
         except Exception as exc:
+            self.status.record_event("speaker_reboot_attempt", requestedBy="user", acknowledged=False)
             self.status.mark_action("Manual speaker reboot failed", str(exc))
             return
+        self.status.record_command("speaker_reboot", requestedBy="user", acknowledged=True)
         self._last_reboot = now
         self._save_last_reboot(now)
         self._reboot_recovery_at = now
@@ -568,6 +764,7 @@ class SpeakerSupervisor:
         except (OSError, socket.timeout) as exc:
             # A connection failure means the command was not delivered. Retry
             # after the recovery wait; do not consume the reboot cooldown.
+            self.status.record_event("speaker_reboot_attempt", requestedBy="supervisor", reason=reason, acknowledged=False)
             self.status.mark_action("Speaker reboot command could not connect", f"{reason}: {exc}")
             self._reboot_recovery_at = now
             self._reboot_recovery_deadline = now + 60
@@ -577,10 +774,12 @@ class SpeakerSupervisor:
             # cooldown because it may have rebooted before the reply was read.
             self._last_reboot = now
             self._save_last_reboot(now)
+            self.status.record_event("speaker_reboot_attempt", requestedBy="supervisor", reason=reason, acknowledged=False)
             self.status.mark_action("Speaker reboot acknowledgement missing", f"{reason}: {exc}", reboot_attempt=True)
             self._reboot_recovery_at = now
             self._reboot_recovery_deadline = now + 60
             return
+        self.status.record_command("speaker_reboot", requestedBy="supervisor", reason=reason, acknowledged=True)
         self._last_reboot = now
         self._save_last_reboot(now)
         self._reboot_recovery_at = now

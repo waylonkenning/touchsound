@@ -8,8 +8,14 @@ services:
       - ${SOUNDTOUCH_IP:?Set SOUNDTOUCH_IP}
       - --relay-url
       - ${RELAY_URL:?Set RELAY_URL to the Docker host LAN URL}
+      - --event-log
+      - /data/speaker-history.jsonl
     ports:
       - "8765:8765"
     volumes:
       - ./stations.json:/app/stations.json:ro
+      - touchsound_data:/data
     restart: unless-stopped
+
+volumes:
+  touchsound_data:
