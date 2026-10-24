@@ -37,14 +37,17 @@ While the bridge is running, check its health and station descriptor from a mach
 
 ```sh
 curl http://<bridge-host-ip>:8765/health
+curl http://<bridge-host-ip>:8765/status
 curl http://<bridge-host-ip>:8765/radio/1.json
 ```
 
-The first command should return `ok`. The descriptor should include the configured station name and source URL. A `/stream/<slot>` request starts a live audio response and is not intended to return a short text response.
+`/health` returns `ok` only when the bridge's WebSocket and speaker checks pass and, during managed playback, the speaker is receiving the expected stream. `/status` gives the detailed state. The station descriptor should include the configured station name and source URL. A `/stream/<slot>` request starts a live audio response and is not intended to return a short text response.
+
+The supervisor checks every 15 seconds. It retries the active preset before attempting a reboot and will not reboot more than once per 30 minutes. It does not intervene after a manual pause or input change. If `/status` shows the speaker API responding but the relay has no recent bytes, check the upstream station URL and FFmpeg before suspecting the speaker. The health check cannot measure sound from the physical speaker.
 
 ## Check speaker status
 
-The read-only status command uses the SoundTouch HTTP API on port `8090`:
+The read-only status command uses the SoundTouch HTTP API on port `8090`. The health supervisor also uses this port to inspect the active source and volume:
 
 ```sh
 python3 touchsound.py status --speaker <speaker-ip>

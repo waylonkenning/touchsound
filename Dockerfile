@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 WORKDIR /app
 COPY server.py /app/server.py
 COPY bridge.py /app/bridge.py
+COPY runtime.py /app/runtime.py
 COPY stations.json /app/stations.json
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt

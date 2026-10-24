@@ -8,6 +8,8 @@ import json
 import re
 import shutil
 import subprocess
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -65,7 +67,21 @@ class StationHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send(500, str(exc).encode("utf-8"), "text/plain; charset=utf-8")
                 return
-            self._send(200, b"ok\n", "text/plain; charset=utf-8")
+            runtime_status = getattr(self.server, "runtime_status", None)
+            if runtime_status is None:
+                self._send(200, b"ok\n", "text/plain; charset=utf-8")
+                return
+            snapshot = runtime_status.snapshot()
+            healthy = bool(snapshot.get("healthy"))
+            self._send(200 if healthy else 503, b"ok\n" if healthy else b"degraded\n", "text/plain; charset=utf-8")
+            return
+
+        if self.path == "/status":
+            runtime_status = getattr(self.server, "runtime_status", None)
+            if runtime_status is None:
+                self._send(200, json.dumps({"healthy": True, "relay": "running"}).encode(), "application/json; charset=utf-8")
+            else:
+                self._send(200, json.dumps(runtime_status.snapshot(), ensure_ascii=False).encode(), "application/json; charset=utf-8")
             return
 
         stream_match = STREAM_PATTERN.fullmatch(urlsplit(self.path).path)
@@ -101,6 +117,20 @@ class StationHandler(BaseHTTPRequestHandler):
         body = json.dumps(descriptor, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send(200, body, "application/json; charset=utf-8")
 
+    def do_POST(self) -> None:
+        if self.path != "/control/reboot":
+            self._send(404, b"not found\n", "text/plain; charset=utf-8")
+            return
+        if self.client_address[0] not in {"127.0.0.1", "::1"}:
+            self._send(403, b"local access only\n", "text/plain; charset=utf-8")
+            return
+        request_reboot = getattr(self.server, "request_speaker_reboot", None)
+        if request_reboot is None:
+            self._send(503, b"speaker control unavailable\n", "text/plain; charset=utf-8")
+            return
+        request_reboot()
+        self._send(202, b"speaker restart queued\n", "text/plain; charset=utf-8")
+
     def _stream(self, slot: str) -> None:
         """Relay one upstream source as MP3, stopping FFmpeg on disconnect."""
         try:
@@ -128,6 +158,11 @@ class StationHandler(BaseHTTPRequestHandler):
             self._send(503, f"Cannot start ffmpeg: {exc}\n".encode(), "text/plain; charset=utf-8")
             return
 
+        stream_id = f"{threading.get_ident()}-{time.monotonic_ns()}"
+        runtime_status = getattr(self.server, "runtime_status", None)
+        if runtime_status is not None:
+            runtime_status.stream_started(stream_id, slot, self.client_address[0])
+
         self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "audio/mpeg")
@@ -142,6 +177,8 @@ class StationHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(block)
                 self.wfile.flush()
+                if runtime_status is not None:
+                    runtime_status.stream_bytes(stream_id, len(block))
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
@@ -154,6 +191,8 @@ class StationHandler(BaseHTTPRequestHandler):
                     process.wait()
             if process.stdout is not None:
                 process.stdout.close()
+            if runtime_status is not None:
+                runtime_status.stream_finished(stream_id)
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)

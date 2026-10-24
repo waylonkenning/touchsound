@@ -13,10 +13,12 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import websocket
 
 from server import StationHandler, load_stations
+from runtime import RuntimeStatus, SpeakerSupervisor
 
 
 def local_ip_for(speaker: str) -> str:
@@ -86,7 +88,8 @@ def soap_request(speaker: str, action_name: str, action_args: dict[str, str]) ->
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=8) as response:
             response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
@@ -98,10 +101,11 @@ def soap_request(speaker: str, action_name: str, action_args: dict[str, str]) ->
 class PresetBridge:
     """Map SoundTouch preset events to configured stations and start playback."""
 
-    def __init__(self, speaker: str, relay_url: str, stations: dict[str, dict[str, str]]) -> None:
+    def __init__(self, speaker: str, relay_url: str, stations: dict[str, dict[str, str]], status: RuntimeStatus) -> None:
         self.speaker = speaker
         self.relay_url = relay_url.rstrip("/")
         self.stations = stations
+        self.status = status
         self.reconnect_delay = 1
 
     def play_preset(self, slot: str) -> None:
@@ -112,18 +116,27 @@ class PresetBridge:
             return
         url = f"{self.relay_url}/stream/{slot}"
         print(f"Preset {slot}: playing {station['name']}", flush=True)
+        self.status.play_command_started()
         metadata = make_didl(station["name"], url)
-        soap_request(self.speaker, "SetAVTransportURI", {
-            "InstanceID": "0",
-            "CurrentURI": url,
-            "CurrentURIMetaData": metadata,
-        })
-        soap_request(self.speaker, "Play", {"InstanceID": "0", "Speed": "1"})
+        try:
+            soap_request(self.speaker, "SetAVTransportURI", {
+                "InstanceID": "0",
+                "CurrentURI": url,
+                "CurrentURIMetaData": metadata,
+            })
+            soap_request(self.speaker, "Play", {"InstanceID": "0", "Speed": "1"})
+        except Exception as exc:
+            self.status.playback_error(str(exc))
+            raise
 
     def on_message(self, _ws: websocket.WebSocketApp, message: str) -> None:
+        self.status.websocket_message()
         slot = parse_preset_press(message)
         if slot is None:
             return
+        station = self.stations.get(slot)
+        if station is not None:
+            self.status.select_preset(slot, station["name"])
         try:
             self.play_preset(slot)
         except Exception as exc:
@@ -135,10 +148,11 @@ class PresetBridge:
 
     def on_open(self, _ws: websocket.WebSocketApp) -> None:
         self.reconnect_delay = 1
+        self.status.websocket_opened()
         print("Connected to SoundTouch button events", flush=True)
 
-    @staticmethod
-    def on_close(_ws: websocket.WebSocketApp, code: int | None, message: str | None) -> None:
+    def on_close(self, _ws: websocket.WebSocketApp, code: int | None, message: str | None) -> None:
+        self.status.websocket_closed()
         print(f"WebSocket closed ({code}): {message or ''}", flush=True)
 
     def run(self) -> None:
@@ -167,6 +181,10 @@ def main() -> None:
     parser.add_argument("--relay-url", help="LAN URL the speaker can reach; derived from the route to the speaker if omitted")
     parser.add_argument("--bind", default="0.0.0.0", help="Address for the local audio relay (default: all LAN interfaces)")
     parser.add_argument("--port", type=int, default=8765, help="Local relay port (default: 8765)")
+    parser.add_argument("--monitor-interval", type=int, default=15, help="Seconds between speaker health checks (default: 15)")
+    parser.add_argument("--reboot-cooldown", type=int, default=1800, help="Minimum seconds between automatic reboots (default: 1800)")
+    parser.add_argument("--state-file", help="Path for persisted supervisor cooldown state")
+    parser.add_argument("--no-auto-reboot", action="store_true", help="Report faults and retry playback without rebooting the speaker")
     args = parser.parse_args()
 
     try:
@@ -176,18 +194,59 @@ def main() -> None:
         if parsed.scheme != "http" or not parsed.netloc or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
             raise ValueError("--relay-url must be an http:// host:port URL without a path")
         relay_url = relay_url.rstrip("/")
+        if args.monitor_interval < 5:
+            raise ValueError("--monitor-interval must be at least 5 seconds")
+        if args.reboot_cooldown < 60:
+            raise ValueError("--reboot-cooldown must be at least 60 seconds")
         server = ThreadingHTTPServer((args.bind, args.port), StationHandler)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
 
-    threading.Thread(target=server.serve_forever, name="touchsound-relay", daemon=True).start()
+    status = RuntimeStatus(args.speaker, relay_url)
+    server.runtime_status = status
+
+    bridge = PresetBridge(args.speaker, relay_url, stations, status)
+    supervisor = SpeakerSupervisor(
+        args.speaker,
+        relay_url,
+        status,
+        bridge.play_preset,
+        stations,
+        interval=args.monitor_interval,
+        reboot_cooldown=args.reboot_cooldown,
+        auto_reboot=not args.no_auto_reboot,
+        state_file=Path(args.state_file).expanduser() if args.state_file else None,
+    )
+    server.request_speaker_reboot = supervisor.request_manual_reboot
+
+    relay_stop = threading.Event()
+
+    def serve_relay() -> None:
+        while not relay_stop.is_set():
+            status.relay_state(True)
+            try:
+                server.serve_forever(poll_interval=0.5)
+            except Exception as exc:
+                status.relay_state(False, str(exc))
+                print(f"Relay server error: {exc}", file=sys.stderr, flush=True)
+            else:
+                status.relay_state(False)
+            if not relay_stop.is_set():
+                print("Restarting local relay in 2 seconds", flush=True)
+                relay_stop.wait(2)
+
+    relay_thread = threading.Thread(target=serve_relay, name="touchsound-relay", daemon=True)
+    relay_thread.start()
     print(f"Serving transcoded radio streams at {relay_url}/stream/<slot>", flush=True)
-    bridge = PresetBridge(args.speaker, relay_url, stations)
+    supervisor.start()
+    print("Speaker health monitor active (automatic reboot enabled)", flush=True)
     try:
         bridge.run()
     except KeyboardInterrupt:
         print("Stopping TouchSound", flush=True)
     finally:
+        supervisor.stop()
+        relay_stop.set()
         server.shutdown()
         server.server_close()
 
