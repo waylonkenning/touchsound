@@ -4,6 +4,8 @@ import Network
 
 private let configURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/TouchSound/config.json")
+private let speakerDiscoveryURL = configURL.deletingLastPathComponent()
+    .appendingPathComponent("discovered-speakers.json")
 final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private struct DiscoveredSpeaker {
         let id: String
@@ -30,6 +32,7 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var latestStatus: [String: Any] = [:]
     private var config: [String: Any] = [:]
+    private var loadedConfigData: Data?
     private var speakerProbe: NWConnection?
     private var speakerBrowser: NWBrowser?
     private var speakerNames: [String: String] = [:]
@@ -68,6 +71,7 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startBridgeService()
         refreshStatus()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.refreshConfigIfChanged()
             self?.refreshStatus()
         }
         NSApp.activate(ignoringOtherApps: false)
@@ -135,9 +139,34 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let data = try? Data(contentsOf: configURL),
               let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             config = [:]
+            loadedConfigData = nil
             return
         }
         config = parsed
+        loadedConfigData = data
+    }
+
+    private func refreshConfigIfChanged() {
+        guard let data = try? Data(contentsOf: configURL), data != loadedConfigData,
+              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        let previousAddress = speakerAddress
+        let previousName = config["speakerName"] as? String ?? ""
+        config = parsed
+        loadedConfigData = data
+        let addressChanged = previousAddress != speakerAddress
+        let nameChanged = previousName != (config["speakerName"] as? String ?? "")
+        guard addressChanged || nameChanged else { return }
+
+        speakerProbe?.cancel()
+        speakerProbe = nil
+        localSpeakerReachable = nil
+        lastProbeAt = .distantPast
+        latestStatus = [:]
+        updateSpeakerMenu()
+        updateMenuLabels()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.restartBridge()
+        }
     }
 
     private var speakerAddress: String {
@@ -185,6 +214,7 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             failedSpeakerResolutions.remove(id)
             resolveSpeaker(id: id, name: speaker.name, endpoint: speaker.endpoint)
         }
+        writeSpeakerInventory()
         updateSpeakerMenu()
     }
 
@@ -221,9 +251,9 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func ipAddress(from host: NWEndpoint.Host) -> String? {
         switch host {
         case .ipv4(let address):
-            return String(describing: address)
+            return String(describing: address).components(separatedBy: "%").first
         case .name(let name, _):
-            return name
+            return name.components(separatedBy: "%").first
         case .ipv6:
             return nil
         @unknown default:
@@ -244,7 +274,24 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             failedSpeakerResolutions.insert(id)
         }
+        writeSpeakerInventory()
         updateSpeakerMenu()
+    }
+
+    private func writeSpeakerInventory() {
+        let entries: [[String: String]] = discoveredSpeakers.values
+            .map { ["name": $0.name, "address": $0.address] }
+            .sorted { ($0["name"] ?? "").localizedCaseInsensitiveCompare($1["name"] ?? "") == .orderedAscending }
+        guard let data = try? JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys]) else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: speakerDiscoveryURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: speakerDiscoveryURL, options: .atomic)
+        } catch {
+            NSLog("TouchSound could not save Bonjour speaker inventory: %@", error.localizedDescription)
+        }
     }
 
     private func updateSpeakerMenu() {
@@ -289,6 +336,7 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         speakerNames.removeAll()
         discoveredSpeakers.removeAll()
         failedSpeakerResolutions.removeAll()
+        writeSpeakerInventory()
         updateSpeakerMenu()
         startSpeakerDiscovery()
     }
@@ -303,6 +351,7 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
             try data.write(to: configURL, options: .atomic)
+            loadedConfigData = data
         } catch {
             let alert = NSAlert()
             alert.messageText = "Could not save the selected speaker"
@@ -521,10 +570,14 @@ final class TouchSoundApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let eventLogPath = self.config["eventLogPath"] as? String, !eventLogPath.isEmpty {
                     arguments += ["--event-log", eventLogPath]
                 }
+                arguments += ["--speaker-config-file", configURL.path]
+                arguments += ["--speaker-discovery-file", speakerDiscoveryURL.path]
                 process.arguments = arguments
                 process.environment = [
                     "PYTHONUNBUFFERED": "1",
                     "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                    "TOUCHSOUND_STATIONS_OVERRIDES_FILE": configURL.deletingLastPathComponent()
+                        .appendingPathComponent("station-overrides.json").path,
                 ]
                 process.standardOutput = FileHandle.standardOutput
                 process.standardError = FileHandle.standardError

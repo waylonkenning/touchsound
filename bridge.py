@@ -227,6 +227,8 @@ def main() -> None:
         default=str(Path.home() / ".touchsound" / "mobile-control.token"),
         help="Private file containing the 12-digit phone pairing code",
     )
+    parser.add_argument("--speaker-config-file", help="TouchSound config file to update when a phone selects a speaker")
+    parser.add_argument("--speaker-discovery-file", help="JSON file containing Bonjour-discovered SoundTouch speakers")
     parser.add_argument("--no-auto-reboot", action="store_true", help="Report faults and retry playback without rebooting the speaker")
     args = parser.parse_args()
 
@@ -252,6 +254,8 @@ def main() -> None:
     )
     server.runtime_status = status
     server.speaker_name = args.speaker_name or args.speaker
+    server.speaker_config_file = Path(args.speaker_config_file).expanduser() if args.speaker_config_file else None
+    server.speaker_discovery_file = Path(args.speaker_discovery_file).expanduser() if args.speaker_discovery_file else None
     try:
         server.mobile_access = MobileAccess(Path(args.control_token_file))
     except (OSError, ValueError) as exc:
@@ -266,6 +270,29 @@ def main() -> None:
         status.select_preset(slot, station["name"])
         bridge.play_preset(slot)
 
+    def request_station_assignment(slot: str, station: dict[str, str], station_uuid: str) -> None:
+        previous = stations.get(slot, {}).get("name")
+        stations[slot] = station
+        status.record_event(
+            "preset_station_assigned",
+            slot=slot,
+            station=station["name"],
+            previousStation=previous,
+            provider="Radio Browser",
+            stationUuid=station_uuid,
+        )
+
+    def request_station_edit(slot: str, station: dict[str, str]) -> None:
+        previous = stations.get(slot, {}).get("name")
+        stations[slot] = station
+        status.record_event(
+            "preset_station_edited",
+            slot=slot,
+            station=station["name"],
+            previousStation=previous,
+            provider="Manual",
+        )
+
     supervisor = SpeakerSupervisor(
         args.speaker,
         relay_url,
@@ -279,6 +306,8 @@ def main() -> None:
     )
     server.request_speaker_reboot = supervisor.request_manual_reboot
     server.request_preset_play = request_preset_play
+    server.request_station_assignment = request_station_assignment
+    server.request_station_edit = request_station_edit
     server.request_transport_control = bridge.control_transport
     server.request_volume = bridge.set_volume
 

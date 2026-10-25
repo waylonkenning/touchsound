@@ -33,9 +33,13 @@ The `nowSelectionUpdated` event is parsed as XML. A recognized preset id selects
 
 The macOS menu bar app polls `/status` every five seconds and also checks whether the speaker accepts TCP connections. It browses Bonjour service `_soundtouch._tcp` in the local domain and resolves each result to its reachable host address. Choose a discovered device from the **SoundTouch Speakers** submenu to save it as the active speaker and restart the bridge service. The app starts `service.py run` as a child process and restarts that process if it exits. The watchdog restarts `bridge.py` if the bridge process exits. `launchd` starts the menu app at login and relaunches it if it exits. The menu exposes bridge and speaker status, bridge start/stop/restart controls, a speaker restart action, the service log, the 48-hour speaker history, and the mobile web app. A requested speaker restart is sent to `/control/reboot` and queued on the supervisor thread, which records the reboot time and observes the normal recovery cooldown. Loopback requests from the menu app remain allowed; phone requests need a paired bearer token.
 
-The mobile web app is static HTML, CSS, and JavaScript served by the bridge at `/`. It polls `/status` and `/events`, reads preset names from `/api/config`, and sends commands to the same origin. Pairing exchanges a 12-digit code from the owner-only `mobile-control.token` file for a random in-memory session token. Failed code attempts are rate-limited per client IP. Session tokens are cleared when the bridge process restarts. The app does not enable CORS; its control requests require an `Authorization: Bearer` header. The local HTTP endpoints still rely on the home LAN as the trust boundary, so port `8765` must not be exposed to the public internet.
+The mobile web app is static HTML, CSS, and JavaScript served by the bridge at `/`. It polls `/status`, `/events`, `/api/config`, and `/api/speakers`, then sends commands to the same origin. Pairing exchanges a 12-digit code from the owner-only `mobile-control.token` file for a random bearer token. Session tokens are persisted in the owner-only `mobile-sessions.json` file and expire after 30 days, so a speaker switch can restart the bridge without requiring the phone to pair again. Failed code attempts are rate-limited per client IP. The app does not enable CORS; its control requests require an `Authorization: Bearer` header. The local HTTP endpoints still rely on the home LAN as the trust boundary, so port `8765` must not be exposed to the public internet.
 
-The phone layout prioritizes the current playback state, transport and volume controls, and all six presets. The 48-hour activity list is behind an expandable summary so it remains available without pushing the controls off a typical iPhone screen.
+The phone layout prioritizes the speaker selector, current playback state, transport and volume controls, and all six presets. The macOS menu bar app publishes its Bonjour-discovered speaker inventory to the bridge. The phone can request a switch only to one of those discovered devices; the app observes the saved selection and restarts the bridge with the new speaker. The 48-hour activity list is behind an expandable summary so it remains available without pushing the controls off a typical iPhone screen. After a preset selection, the web app compares the requested relay URL and selection generation with the speaker's reported URL and track metadata. It shows **Switching to [station]…** until the transition is reflected, then uses the preset station name if the speaker continues to report the previous track title. If the expected URL is still missing after the 45-second startup grace, the card shows **Not confirmed**.
+
+The phone's **Manage stations** panel searches the public Radio Browser directory by station name or genre and lets the user edit a preset's station name and direct stream URL. `server.py` discovers a Radio Browser mirror through DNS and reverse DNS, uses HTTPS, hides directory entries marked broken, limits results to 20, and caches each search for five minutes. When a paired phone saves a search result, the bridge fetches its current direct stream URL by station UUID. Both search assignments and manual edits validate the name and HTTP or HTTPS stream URL, then write the station into a local override file. Saving a station only changes the preset mapping; the user starts playback by tapping that preset. Directory search and assignment need outbound internet access; manual edits do not. See the [Radio Browser API documentation](https://docs.radio-browser.info/) for the directory interface and its [server discovery guidance](https://api.radio-browser.info/).
+
+On macOS the override file is `~/Library/Application Support/TouchSound/station-overrides.json`; in Docker it is `/data/station-overrides.json` in the persistent data volume. Overrides take precedence over `stations.json`, keeping phone changes across app updates and container recreation.
 
 The stream URL sent to the speaker is the relay URL, not the provider URL. The bridge therefore does not depend on the speaker understanding the upstream format. For each `/stream/<slot>` request, `server.py` runs FFmpeg with the station's source URL and writes MP3 audio to the HTTP response. When the speaker disconnects, the FFmpeg process is terminated.
 
@@ -51,12 +55,17 @@ The HTTP server listens on TCP port `8765` by default and binds to all interface
 | `/status` | JSON health snapshot for the bridge, speaker, playback, relay, and supervisor |
 | `/events` | JSON speaker state changes and bridge commands from the last 48 hours |
 | `/` | Mobile web controller |
-| `/api/config` | Configured speaker label and six preset names |
-| `/api/pair` | Exchange the local pairing code for an in-memory phone session |
+| `/api/config` | Configured speaker label and six preset names and stream URLs |
+| `/api/speakers` | Bonjour-discovered speakers and current selection |
+| `/api/stations/search?q=...&mode=name\|tag` | Search working Radio Browser entries; at most 20 results |
+| `/api/pair` | Exchange the local pairing code for a 30-day phone session |
 | `/api/session` | Check whether a phone session is still active |
 | `/control/play/1` through `/control/play/6` | POST to start a configured preset; loopback or paired phone |
 | `/control/pause`, `/control/resume`, `/control/stop` | POST speaker transport controls; loopback or paired phone |
 | `/control/volume` | POST `{"volume":0..100}`; loopback or paired phone |
+| `/control/speaker` | POST a discovered speaker address; loopback or paired phone |
+| `/control/stations/assign` | POST `{"slot":"1".."6","stationUuid":"..."}` to save a directory station; paired phone |
+| `/control/stations/edit` | POST `{"slot":"1".."6","name":"...","streamUrl":"http(s)://..."}` to edit a preset; paired phone |
 | `/control/reboot` | POST to queue a manual speaker restart; loopback or paired phone |
 
 The bridge needs network access to speaker ports `8080` (WebSocket notifications), `8090` (SoundTouch status), and `8091` (UPnP control). Automatic reboot also uses the speaker's local diagnostic shell on port `17000`.
@@ -72,6 +81,7 @@ The bridge needs network access to speaker ports `8080` (WebSocket notifications
 | `macos/TouchSoundMenu.swift` | Native menu bar UI that supervises the bridge child and displays health and controls |
 | `macos/install.py` | Build/install the menu app, configure the user LaunchAgent, and remove legacy service registration |
 | `stations.json` | Preset-to-station names and source URLs |
+| `station-overrides.json` | Optional saved station entries that take precedence over `stations.json` |
 | `touchsound.py` | Read speaker status and provide an experimental preset-writing command |
 | `Dockerfile`, `compose.yaml` | Container image and Compose deployment |
 

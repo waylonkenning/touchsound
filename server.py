@@ -8,21 +8,37 @@ import hmac
 import ipaddress
 import json
 import os
+import random
 import re
 import secrets
 import shutil
+import socket
 import subprocess
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "stations.json"
+_station_overrides = os.environ.get("TOUCHSOUND_STATIONS_OVERRIDES_FILE", "").strip()
+STATION_OVERRIDES_PATH = Path(_station_overrides).expanduser() if _station_overrides else None
 SLOT_PATTERN = re.compile(r"^/radio/([1-6])\.json$")
 STREAM_PATTERN = re.compile(r"^/stream/([1-6])$")
+STATION_UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+RADIO_BROWSER_DNS_NAME = "all.api.radio-browser.info"
+RADIO_BROWSER_TIMEOUT_SECONDS = 6
+RADIO_BROWSER_MAX_RESPONSE_BYTES = 2_000_000
+RADIO_BROWSER_CACHE_SECONDS = 300
+_radio_browser_hosts_lock = threading.Lock()
+_radio_browser_hosts_cache: tuple[float, list[str]] = (0, [])
+_station_search_cache_lock = threading.Lock()
+_station_search_cache: dict[tuple[str, str], tuple[float, list[dict[str, object]]]] = {}
 WEB_ROOT = ROOT / "web"
 WEB_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -42,6 +58,17 @@ def load_stations() -> dict[str, dict[str, str]]:
 
     if not isinstance(raw, dict):
         raise ValueError("stations.json must contain an object keyed by preset number")
+
+    if STATION_OVERRIDES_PATH is not None:
+        try:
+            overrides = json.loads(STATION_OVERRIDES_PATH.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            overrides = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read {STATION_OVERRIDES_PATH}: {exc}") from exc
+        if not isinstance(overrides, dict):
+            raise ValueError("Station overrides must contain an object keyed by preset number")
+        raw.update(overrides)
 
     stations: dict[str, dict[str, str]] = {}
     for slot, item in raw.items():
@@ -67,16 +94,258 @@ def load_stations() -> dict[str, dict[str, str]]:
     return stations
 
 
+def radio_browser_hosts() -> list[str]:
+    """Discover healthy Radio Browser mirrors through DNS and reverse DNS."""
+    global _radio_browser_hosts_cache
+    now = time.time()
+    with _radio_browser_hosts_lock:
+        expires_at, cached = _radio_browser_hosts_cache
+        if now < expires_at and cached:
+            return list(cached)
+
+    try:
+        addresses = {
+            result[4][0]
+            for result in socket.getaddrinfo(RADIO_BROWSER_DNS_NAME, 443, type=socket.SOCK_STREAM)
+        }
+    except OSError as exc:
+        raise RuntimeError("Could not discover Radio Browser servers") from exc
+
+    hosts: set[str] = set()
+    for address in addresses:
+        try:
+            hostname = socket.gethostbyaddr(address)[0].rstrip(".").lower()
+        except OSError:
+            continue
+        if hostname.endswith(".api.radio-browser.info") and hostname != RADIO_BROWSER_DNS_NAME:
+            hosts.add(hostname)
+    if not hosts:
+        raise RuntimeError("No Radio Browser servers were discovered")
+
+    discovered = sorted(hosts)
+    random.SystemRandom().shuffle(discovered)
+    with _radio_browser_hosts_lock:
+        _radio_browser_hosts_cache = (now + 3600, discovered)
+    return discovered
+
+
+def radio_browser_request(path: str, parameters: dict[str, str]) -> object:
+    """Read a bounded JSON response from an available Radio Browser mirror."""
+    failures: list[str] = []
+    for host in radio_browser_hosts():
+        url = f"https://{host}{path}?{urlencode(parameters)}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "TouchSound/1.1 (+https://github.com/waylonkenning/touchsound)",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=RADIO_BROWSER_TIMEOUT_SECONDS) as response:
+                if urlsplit(response.geturl()).scheme != "https":
+                    raise RuntimeError("Radio Browser redirected to an insecure connection")
+                payload = response.read(RADIO_BROWSER_MAX_RESPONSE_BYTES + 1)
+            if len(payload) > RADIO_BROWSER_MAX_RESPONSE_BYTES:
+                raise RuntimeError("Radio Browser returned too much data")
+            return json.loads(payload)
+        except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, RuntimeError) as exc:
+            failures.append(f"{host}: {exc}")
+    raise RuntimeError("Radio Browser is temporarily unavailable") from (OSError("; ".join(failures)) if failures else None)
+
+
+def search_radio_stations(query: str, mode: str) -> list[dict[str, object]]:
+    """Search working Radio Browser stations by name or genre tag."""
+    cache_key = (mode, query.casefold())
+    now = time.time()
+    with _station_search_cache_lock:
+        cached = _station_search_cache.get(cache_key)
+        if cached and now < cached[0]:
+            return [dict(item) for item in cached[1]]
+
+    parameters = {
+        "hidebroken": "true",
+        "order": "clickcount",
+        "reverse": "true",
+        "limit": "20",
+        mode: query,
+    }
+    result = radio_browser_request("/json/stations/search", parameters)
+    if not isinstance(result, list):
+        raise RuntimeError("Radio Browser returned an unexpected search response")
+
+    stations: list[dict[str, object]] = []
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        station_uuid = item.get("stationuuid")
+        name = item.get("name")
+        if not isinstance(station_uuid, str) or not STATION_UUID_PATTERN.fullmatch(station_uuid):
+            continue
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = normalize_station_name(name)
+        try:
+            bitrate = int(item.get("bitrate") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        stations.append({
+            "stationUuid": station_uuid.lower(),
+            "name": name.strip()[:200],
+            "country": str(item.get("country") or ""),
+            "countryCode": str(item.get("countrycode") or ""),
+            "codec": str(item.get("codec") or "").upper(),
+            "bitrate": max(0, bitrate),
+            "tags": str(item.get("tags") or "")[:160],
+        })
+
+    with _station_search_cache_lock:
+        _station_search_cache[cache_key] = (now + RADIO_BROWSER_CACHE_SECONDS, stations)
+        if len(_station_search_cache) > 128:
+            expired = [key for key, value in _station_search_cache.items() if value[0] <= now]
+            for key in expired:
+                _station_search_cache.pop(key, None)
+            if len(_station_search_cache) > 128:
+                oldest = min(_station_search_cache, key=lambda key: _station_search_cache[key][0])
+                _station_search_cache.pop(oldest, None)
+    return [dict(item) for item in stations]
+
+
+def fetch_radio_station(station_uuid: str) -> dict[str, str]:
+    """Fetch a station's current direct stream URL by its stable UUID."""
+    result = radio_browser_request("/json/stations/byuuid", {"uuids": station_uuid})
+    if not isinstance(result, list) or not result or not isinstance(result[0], dict):
+        raise ValueError("That station is no longer listed in Radio Browser")
+    item = result[0]
+    name, stream_url = item.get("name"), item.get("url_resolved") or item.get("url")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Radio Browser did not provide a station name")
+    if not isinstance(stream_url, str) or not stream_url.strip():
+        raise ValueError("Radio Browser did not provide a direct station stream URL")
+    name = normalize_station_name(name)
+    try:
+        return validate_station_definition(name, stream_url)
+    except ValueError as exc:
+        raise ValueError(f"Radio Browser returned an invalid station stream URL: {exc}") from exc
+
+
+def normalize_station_name(name: str) -> str:
+    """Normalize directory titles and fit the 200-character UI field limit."""
+    normalized = " ".join(name.split())
+    if len(normalized) > 200:
+        return f"{normalized[:197].rstrip()}..."
+    return normalized
+
+
+def validate_station_definition(name_value: object, stream_url_value: object) -> dict[str, str]:
+    """Validate a manually entered or directory-provided station definition."""
+    if not isinstance(name_value, str) or not isinstance(stream_url_value, str):
+        raise ValueError("Enter both a station name and stream URL")
+    name = name_value.strip()
+    stream_url = stream_url_value.strip()
+    if not name or not stream_url:
+        raise ValueError("Enter both a station name and stream URL")
+    if len(name) > 200 or any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise ValueError("Station names must be at most 200 characters and contain no control characters")
+    if len(stream_url) > 2048 or any(character.isspace() or ord(character) < 32 for character in stream_url):
+        raise ValueError("Stream URLs must be at most 2048 characters and contain no whitespace")
+    try:
+        parsed = urlsplit(stream_url)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("Enter a valid stream URL") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Stream URL must be an absolute HTTP or HTTPS URL")
+    if parsed.username or parsed.password:
+        raise ValueError("Stream URLs must not contain login credentials")
+    return {"name": name, "streamUrl": stream_url}
+
+
+def save_station_preset(slot: str, station: dict[str, str]) -> None:
+    """Persist one preset in the writable override file or base configuration."""
+    target = STATION_OVERRIDES_PATH or CONFIG_PATH
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read station configuration: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("Station configuration must be an object keyed by preset number")
+    raw[slot] = station
+
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        permissions = target.stat().st_mode & 0o777
+    except OSError:
+        permissions = 0o600
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=target.parent,
+            prefix=f".{target.name}-", suffix=".tmp", delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            os.fchmod(output.fileno(), permissions)
+            json.dump(raw, output, ensure_ascii=False, indent=2, sort_keys=True)
+            output.write("\n")
+        os.replace(temporary_path, target)
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def load_discovered_speakers(path: Path | str | None) -> list[dict[str, str]]:
+    """Read the Bonjour inventory maintained by the macOS menu app."""
+    if not path:
+        return []
+    try:
+        raw = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    speakers: dict[str, dict[str, str]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name, address = item.get("name"), item.get("address")
+        if not isinstance(name, str) or not isinstance(address, str):
+            continue
+        name, address = name.strip(), address.strip()
+        if name and address:
+            # Network.framework can append an interface zone to an IPv4 host
+            # (for example, 192.168.4.28%en0). SoundTouch control uses the
+            # plain IPv4 address, so remove that zone before exposing it.
+            unscoped = address.partition("%")[0]
+            try:
+                parsed = ipaddress.ip_address(unscoped)
+            except ValueError:
+                pass
+            else:
+                if isinstance(parsed, ipaddress.IPv4Address):
+                    address = str(parsed)
+            speakers[address] = {"name": name, "address": address}
+    return sorted(speakers.values(), key=lambda speaker: speaker["name"].casefold())
+
+
 class MobileAccess:
-    """Pair phone browsers with short-lived control sessions using a local code."""
+    """Pair local phone browsers with sessions that survive bridge restarts."""
+
+    SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+    MAX_SESSIONS = 16
 
     def __init__(self, token_file: Path) -> None:
         self.token_file = token_file.expanduser()
+        self.session_file = self.token_file.with_name("mobile-sessions.json")
         self.code = self._load_or_create_code()
-        self._sessions: set[str] = set()
+        self._lock = threading.Lock()
+        self._sessions = self._load_sessions()
         self._failures: dict[str, list[float]] = {}
         self._locked_until: dict[str, float] = {}
-        self._lock = threading.Lock()
 
     def _load_or_create_code(self) -> str:
         self.token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -98,6 +367,55 @@ class MobileAccess:
         except OSError:
             pass
         return code
+
+    def _load_sessions(self) -> dict[str, float]:
+        try:
+            raw = json.loads(self.session_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        now = time.time()
+        sessions = {
+            token: float(expires)
+            for token, expires in raw.items()
+            if isinstance(token, str)
+            and len(token) == 43
+            and isinstance(expires, (int, float))
+            and not isinstance(expires, bool)
+            and now < expires <= now + self.SESSION_TTL_SECONDS
+        }
+        if len(sessions) > self.MAX_SESSIONS:
+            sessions = dict(sorted(sessions.items(), key=lambda item: item[1], reverse=True)[:self.MAX_SESSIONS])
+        try:
+            self.session_file.chmod(0o600)
+        except OSError:
+            pass
+        return sessions
+
+    def _save_sessions(self) -> None:
+        self.session_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=self.session_file.parent,
+                prefix=".mobile-sessions-", suffix=".tmp", delete=False,
+            ) as output:
+                temporary_path = Path(output.name)
+                os.fchmod(output.fileno(), 0o600)
+                json.dump(self._sessions, output, separators=(",", ":"))
+                output.write("\n")
+            os.replace(temporary_path, self.session_file)
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+        try:
+            self.session_file.chmod(0o600)
+        except OSError:
+            pass
 
     def pair(self, client_ip: str, candidate: str) -> tuple[str | None, int | None]:
         """Return a session token, or a retry delay when the code is rejected."""
@@ -122,10 +440,20 @@ class MobileAccess:
                 return None, None
             self._failures.pop(client_ip, None)
             self._locked_until.pop(client_ip, None)
-            if len(self._sessions) >= 16:
-                self._sessions.clear()
+            current_time = time.time()
+            self._sessions = {
+                token: expires for token, expires in self._sessions.items() if expires > current_time
+            }
+            if len(self._sessions) >= self.MAX_SESSIONS:
+                oldest = min(self._sessions, key=self._sessions.get)
+                del self._sessions[oldest]
             session = secrets.token_urlsafe(32)
-            self._sessions.add(session)
+            self._sessions[session] = current_time + self.SESSION_TTL_SECONDS
+            try:
+                self._save_sessions()
+            except OSError:
+                self._sessions.pop(session, None)
+                raise
             return session, None
 
     def authorized(self, authorization: str) -> bool:
@@ -133,7 +461,19 @@ class MobileAccess:
         if scheme.lower() != "bearer" or not token:
             return False
         with self._lock:
-            return any(hmac.compare_digest(token, active) for active in self._sessions)
+            matched = next((active for active in self._sessions if hmac.compare_digest(token, active)), None)
+            if matched is None:
+                return False
+            if self._sessions[matched] > time.time():
+                return True
+            del self._sessions[matched]
+            try:
+                self._save_sessions()
+            except OSError:
+                # The expired session is already rejected in memory; a stale
+                # expired entry on disk is harmless and will be pruned on load.
+                pass
+            return False
 
 
 class StationHandler(BaseHTTPRequestHandler):
@@ -142,7 +482,8 @@ class StationHandler(BaseHTTPRequestHandler):
     server_version = "TouchSound/1.0"
 
     def do_GET(self) -> None:
-        path = urlsplit(self.path).path
+        parsed_path = urlsplit(self.path)
+        path = parsed_path.path
         if path in WEB_FILES:
             filename, content_type = WEB_FILES[path]
             try:
@@ -165,10 +506,45 @@ class StationHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "speaker": {"name": speaker_name, "address": speaker},
                 "stations": [
-                    {"slot": slot, "name": stations[slot]["name"] if slot in stations else None}
+                    {
+                        "slot": slot,
+                        "name": stations[slot]["name"] if slot in stations else None,
+                        "streamUrl": stations[slot]["streamUrl"] if slot in stations else None,
+                    }
                     for slot in (str(number) for number in range(1, 7))
                 ],
             })
+            return
+
+        if path == "/api/speakers":
+            runtime_status = getattr(self.server, "runtime_status", None)
+            address = str(getattr(runtime_status, "speaker", "") or "")
+            name = str(getattr(self.server, "speaker_name", "") or address)
+            discovery_file = getattr(self.server, "speaker_discovery_file", None)
+            config_file = getattr(self.server, "speaker_config_file", None)
+            self._send_json(200, {
+                "canSwitch": bool(discovery_file and config_file),
+                "current": {"name": name, "address": address},
+                "speakers": load_discovered_speakers(discovery_file),
+            })
+            return
+
+        if path == "/api/stations/search":
+            query_values = parse_qs(parsed_path.query, keep_blank_values=True)
+            query = query_values.get("q", [""])[0].strip()
+            mode = query_values.get("mode", ["name"])[0].strip().lower()
+            if len(query) < 2 or len(query) > 80:
+                self._send_json(400, {"error": "Enter 2 to 80 characters to search"})
+                return
+            if mode not in {"name", "tag"}:
+                self._send_json(400, {"error": "Search by station name or genre"})
+                return
+            try:
+                stations = search_radio_stations(query, mode)
+            except RuntimeError:
+                self._send_json(502, {"error": "Radio station search is temporarily unavailable. Try again shortly."})
+                return
+            self._send_json(200, {"provider": "Radio Browser", "count": len(stations), "stations": stations})
             return
 
         if path == "/api/session":
@@ -252,11 +628,14 @@ class StationHandler(BaseHTTPRequestHandler):
 
         reboot_request = path == "/control/reboot"
         play_match = re.fullmatch(r"/control/play/([1-6])", path)
+        speaker_request = path == "/control/speaker"
+        station_assignment_request = path == "/control/stations/assign"
+        station_edit_request = path == "/control/stations/edit"
         transport_action = path.removeprefix("/control/") if path in {
             "/control/pause", "/control/resume", "/control/stop"
         } else None
         volume_request = path == "/control/volume"
-        if not reboot_request and play_match is None and transport_action is None and not volume_request:
+        if not reboot_request and play_match is None and not speaker_request and not station_assignment_request and not station_edit_request and transport_action is None and not volume_request:
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
             return
         if not self._is_loopback_client() and not self._is_private_network_client():
@@ -308,12 +687,152 @@ class StationHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(202, {"message": "Volume command sent"})
             return
+        if station_edit_request:
+            request_edit = getattr(self.server, "request_station_edit", None)
+            if request_edit is None:
+                self._send_json(503, {"error": "Preset editing is unavailable in this TouchSound setup"})
+                return
+            try:
+                body = self._read_json_body()
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            slot = body.get("slot")
+            if not isinstance(slot, str) or slot not in {str(number) for number in range(1, 7)}:
+                self._send_json(400, {"error": "Choose preset 1 through 6"})
+                return
+            try:
+                station = validate_station_definition(body.get("name"), body.get("streamUrl"))
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            try:
+                save_station_preset(slot, station)
+                request_edit(slot, station)
+            except (OSError, ValueError) as exc:
+                self._send_json(500, {"error": f"Could not save preset {slot}: {exc}"})
+                return
+            except Exception as exc:
+                self._send_json(502, {"error": f"Preset was saved, but TouchSound could not reload it: {exc}"})
+                return
+            self._send_json(200, {
+                "message": f"Preset {slot} now uses {station['name']}",
+                "slot": slot,
+                "name": station["name"],
+            })
+            return
+        if station_assignment_request:
+            request_assignment = getattr(self.server, "request_station_assignment", None)
+            if request_assignment is None:
+                self._send_json(503, {"error": "Preset editing is unavailable in this TouchSound setup"})
+                return
+            try:
+                body = self._read_json_body()
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            slot = body.get("slot")
+            station_uuid = body.get("stationUuid")
+            if not isinstance(slot, str) or slot not in {str(number) for number in range(1, 7)}:
+                self._send_json(400, {"error": "Choose preset 1 through 6"})
+                return
+            if not isinstance(station_uuid, str) or not STATION_UUID_PATTERN.fullmatch(station_uuid):
+                self._send_json(400, {"error": "Choose a station from the search results"})
+                return
+            try:
+                station = fetch_radio_station(station_uuid.lower())
+            except ValueError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            except RuntimeError:
+                self._send_json(502, {"error": "Radio station details are temporarily unavailable. Try again shortly."})
+                return
+            try:
+                save_station_preset(slot, station)
+                request_assignment(slot, station, station_uuid.lower())
+            except (OSError, ValueError) as exc:
+                self._send_json(500, {"error": f"Could not save preset {slot}: {exc}"})
+                return
+            except Exception as exc:
+                self._send_json(502, {"error": f"Preset was saved, but TouchSound could not reload it: {exc}"})
+                return
+            self._send_json(200, {
+                "message": f"Preset {slot} now uses {station['name']}",
+                "slot": slot,
+                "name": station["name"],
+            })
+            return
+        if speaker_request:
+            config_file = getattr(self.server, "speaker_config_file", None)
+            discovery_file = getattr(self.server, "speaker_discovery_file", None)
+            if not config_file or not discovery_file:
+                self._send_json(503, {"error": "Speaker switching is available from the macOS menu bar app"})
+                return
+            try:
+                body = self._read_json_body()
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            address = body.get("address")
+            if not isinstance(address, str) or not address.strip():
+                self._send_json(400, {"error": "Choose a discovered SoundTouch speaker"})
+                return
+            selected = next(
+                (speaker for speaker in load_discovered_speakers(discovery_file) if speaker["address"] == address.strip()),
+                None,
+            )
+            if selected is None:
+                self._send_json(409, {"error": "That speaker is no longer available. Refresh and try again."})
+                return
+            runtime_status = getattr(self.server, "runtime_status", None)
+            if selected["address"] == str(getattr(runtime_status, "speaker", "") or ""):
+                self._send_json(200, {"message": "That speaker is already selected"})
+                return
+            try:
+                self._save_speaker_selection(Path(config_file), selected)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._send_json(500, {"error": f"Could not save the selected speaker: {exc}"})
+                return
+            self._send_json(202, {
+                "message": f"Switching to {selected['name']}; TouchSound will reconnect shortly",
+                "speaker": selected,
+            })
+            return
         request_reboot = getattr(self.server, "request_speaker_reboot", None)
         if request_reboot is None:
             self._send(503, b"speaker control unavailable\n", "text/plain; charset=utf-8")
             return
         request_reboot()
         self._send_json(202, {"message": "Speaker restart queued"})
+
+    def _save_speaker_selection(self, config_file: Path, speaker: dict[str, str]) -> None:
+        try:
+            config = json.loads(config_file.expanduser().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read TouchSound configuration: {exc}") from exc
+        if not isinstance(config, dict):
+            raise ValueError("TouchSound configuration must be a JSON object")
+        config["speaker"] = speaker["address"]
+        config["speakerName"] = speaker["name"]
+        target = config_file.expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=target.parent,
+                prefix=f".{target.name}-", suffix=".tmp", delete=False,
+            ) as output:
+                temporary_path = Path(output.name)
+                os.fchmod(output.fileno(), 0o600)
+                json.dump(config, output, ensure_ascii=False, indent=2, sort_keys=True)
+                output.write("\n")
+            os.replace(temporary_path, target)
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _pair_phone(self) -> None:
         access = getattr(self.server, "mobile_access", None)
@@ -332,7 +851,11 @@ class StationHandler(BaseHTTPRequestHandler):
         if not isinstance(code, str):
             self._send_json(400, {"error": "Enter the 12-digit pairing code"})
             return
-        session, retry_after = access.pair(self.client_address[0], code.strip())
+        try:
+            session, retry_after = access.pair(self.client_address[0], code.strip())
+        except OSError as exc:
+            self._send_json(500, {"error": f"Could not save phone pairing: {exc}"})
+            return
         if session is None:
             if retry_after is not None:
                 self._send_json(429, {"error": "Too many attempts. Try again in 15 minutes."})

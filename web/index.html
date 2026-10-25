@@ -32,7 +32,15 @@
           <div>
             <p class="eyebrow">SOUND SYSTEM</p>
             <h1 id="pageTitle">Your listening room</h1>
-            <p class="intro-copy" id="speakerLine">Connecting to your TouchSound bridge…</p>
+            <div class="speaker-picker">
+              <div class="speaker-picker-row">
+                <label class="speaker-picker-label" for="speakerSelect">Speaker</label>
+                <select class="speaker-select" id="speakerSelect" aria-label="Select SoundTouch speaker" disabled>
+                  <option value="">Looking for speakers…</option>
+                </select>
+              </div>
+              <p class="speaker-message" id="speakerMessage" role="status" aria-live="polite"></p>
+            </div>
           </div>
           <div class="refresh-mark" aria-hidden="true">LOCAL · PRIVATE</div>
         </section>
@@ -84,6 +92,59 @@
           <p class="helper-text">TouchSound plays your configured radio streams through the bridge.</p>
         </section>
 
+        <details class="station-finder panel">
+          <summary class="section-heading section-heading-compact">
+            <div>
+              <p class="eyebrow">STATION TOOLS</p>
+              <h2 id="stationFinderTitle">Manage stations</h2>
+            </div>
+            <span class="directory-source">Search &amp; edit</span>
+          </summary>
+          <p class="station-finder-intro">Find a station online or enter a stream URL. Choose a preset to update; saving does not start playback.</p>
+          <details class="preset-editor">
+            <summary class="preset-editor-summary">Edit a preset manually</summary>
+            <form class="preset-editor-form" id="presetEditorForm">
+              <label for="presetEditorSlot">Preset</label>
+              <select class="station-select" id="presetEditorSlot" required>
+                <option value="">Loading presets…</option>
+              </select>
+              <label for="presetEditorName">Station name</label>
+              <input class="station-search-input" id="presetEditorName" name="name" type="text" maxlength="200" autocomplete="off" required>
+              <label for="presetEditorStreamUrl">Direct stream URL</label>
+              <input class="station-search-input" id="presetEditorStreamUrl" name="streamUrl" type="url" inputmode="url" maxlength="2048" placeholder="https://radio.example/live" autocomplete="url" required>
+              <p class="station-target-note">Use a direct HTTP or HTTPS audio stream, not a station webpage. Tap the preset after saving to play the new stream.</p>
+              <button class="button button-primary preset-editor-save" id="presetEditorSaveButton" type="submit">Save preset</button>
+              <p class="station-search-message" id="presetEditorMessage" role="status" aria-live="polite"></p>
+            </form>
+          </details>
+          <h3 class="station-search-heading">Find a station</h3>
+          <form class="station-search-form" id="stationSearchForm">
+            <label for="stationQuery">Search stations</label>
+            <div class="station-search-row">
+              <input class="station-search-input" id="stationQuery" name="q" type="search" minlength="2" maxlength="80" placeholder="Jazz, BBC Radio…" autocomplete="off" required>
+              <button class="button button-primary station-search-button" id="stationSearchButton" type="submit">Search</button>
+            </div>
+            <div class="station-search-options">
+              <label for="stationSearchMode">Search by</label>
+              <select class="station-select" id="stationSearchMode">
+                <option value="name">Station name</option>
+                <option value="tag">Genre or tag</option>
+              </select>
+            </div>
+          </form>
+          <div class="station-target">
+            <label for="stationTargetSlot">Save result to</label>
+            <select class="station-select station-target-select" id="stationTargetSlot">
+              <option value="">Choose a preset</option>
+            </select>
+            <p class="station-target-note">Saving replaces that preset on TouchSound. Tap the preset to start the station.</p>
+          </div>
+          <p class="station-search-message" id="stationSearchMessage" role="status" aria-live="polite">Working stations are searched through Radio Browser.</p>
+          <ol class="station-results" id="stationResults" aria-live="polite">
+            <li class="station-placeholder">Search for a station or genre to see results.</li>
+          </ol>
+        </details>
+
         <details class="history-section panel">
           <summary class="section-heading section-heading-compact">
             <div>
@@ -108,7 +169,7 @@
       <div class="pairing-panel">
         <p class="eyebrow">PHONE CONTROL</p>
         <h2 id="pairingTitle">Pair this phone</h2>
-        <p>Enter the 12-digit code from the TouchSound menu on your Mac. Pairing lets this phone send playback and volume commands on your home network.</p>
+        <p>Enter the 12-digit code from the TouchSound menu on your Mac. Pairing lets this phone control speakers on your home network and remains active for 30 days.</p>
         <form id="pairingForm">
           <label for="pairingCode">Pairing code</label>
           <input id="pairingCode" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{12}" maxlength="12" placeholder="000000000000" required>

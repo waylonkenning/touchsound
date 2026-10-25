@@ -14,6 +14,8 @@ services:
       - ${SOUNDTOUCH_NAME:-SoundTouch speaker}
       - --event-log
       - /data/speaker-history.jsonl
+    environment:
+      TOUCHSOUND_STATIONS_OVERRIDES_FILE: /data/station-overrides.json
     ports:
       - "8765:8765"
     volumes:

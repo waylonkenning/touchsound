@@ -41,7 +41,9 @@ Click the speaker icon in the menu bar to view button-listener, speaker, playbac
 
 ### Open the phone controller
 
-Choose **Open Phone Web App** in the menu bar. TouchSound opens the local page on the Mac and copies a 12-digit pairing code. On the phone, join the same home Wi-Fi, open the LAN address shown in the menu alert, and enter that code. In Safari, choose **Share → Add to Home Screen** to keep an app-style shortcut. The compact iPhone view keeps playback controls and all six configured stations on one screen. Tap **Speaker activity** to expand the rolling 48-hour log.
+Choose **Open Phone Web App** in the menu bar. TouchSound opens the local page on the Mac and copies a 12-digit pairing code. On the phone, join the same home Wi-Fi, open the LAN address shown in the menu alert, and enter that code. In Safari, choose **Share → Add to Home Screen** to keep an app-style shortcut. The compact iPhone view keeps playback controls and all six configured stations on one screen. Tap the speaker selector to choose a Bonjour-discovered speaker; TouchSound restarts the bridge and reconnects to it. Open **Manage stations** to search by station name or genre, or open **Edit a preset manually** to change its name and direct stream URL. Saving changes the preset mapping but does not start playback; tap the preset when you are ready to play it. During a preset change, the player shows **Switching to [station]…** until the speaker confirms the new stream; it shows **Not confirmed** if the expected stream does not arrive. Directory search needs outbound internet access from the bridge host and uses the public [Radio Browser API](https://docs.radio-browser.info/). Tap **Speaker activity** to expand the rolling 48-hour log.
+
+Stations saved from the phone are kept separately from the checked-in `stations.json` file. On macOS, TouchSound stores them in `~/Library/Application Support/TouchSound/station-overrides.json`. The override entries survive app updates and take precedence over the same preset numbers in `stations.json`. Remove an entry from that file to restore its checked-in preset. Docker stores the overrides in its persistent `/data` volume.
 
 You can retrieve the code from Terminal at any time:
 
@@ -49,7 +51,7 @@ You can retrieve the code from Terminal at any time:
 ./.venv/bin/python service.py mobile-code
 ```
 
-The code is stored in `~/Library/Application Support/TouchSound/mobile-control.token` with owner-only file permissions. A bridge restart ends paired browser sessions; the same code can pair the phone again. Phone commands use a paired bearer token. Status, station names, stream URLs, and history remain visible to devices on the LAN without pairing, so do not expose port `8765` to the internet.
+The code is stored in `~/Library/Application Support/TouchSound/mobile-control.token` with owner-only file permissions. Paired sessions survive bridge restarts and expire after 30 days; their tokens are stored in `mobile-sessions.json` with owner-only permissions. Phone commands use a paired bearer token. Status, station names, stream URLs, discovered speakers, and history remain visible to devices on the LAN without pairing, so do not expose port `8765` to the internet.
 
 ### Check and manage the service
 
@@ -85,9 +87,9 @@ RELAY_URL=http://192.168.1.50:8765 \
 docker compose up -d --build
 ```
 
-`SOUNDTOUCH_IP` is the speaker address. `RELAY_URL` must use the Docker host's LAN address and published port `8765`; the speaker cannot use the container's private address. Compose publishes the relay port, restarts the container if it exits, and keeps the event history in its named `touchsound_data` volume.
+`SOUNDTOUCH_IP` is the speaker address. `RELAY_URL` must use the Docker host's LAN address and published port `8765`; the speaker cannot use the container's private address. Compose publishes the relay port, restarts the container if it exits, and keeps event history and station overrides in its named `touchsound_data` volume. Station search and station assignment need outbound internet access from the container.
 
-Open `http://<Docker-host-LAN-address>:8765` on a phone on the same Wi-Fi network. Retrieve its pairing code with `docker compose exec touchsound cat /data/mobile-control.token`, then enter it in the page. The token file stays in the Compose volume.
+Open `http://<Docker-host-LAN-address>:8765` on a phone on the same Wi-Fi network. Retrieve its pairing code with `docker compose exec touchsound cat /data/mobile-control.token`, then enter it in the page. The code and paired-session file stay in the Compose volume. Bonjour-based speaker switching is provided by the macOS menu bar app.
 
 Check playback and logs:
 

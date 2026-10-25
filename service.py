@@ -67,6 +67,8 @@ def _bridge_args(
     no_auto_reboot: bool,
     event_log: str | None = None,
     speaker_name: str | None = None,
+    speaker_config_file: str | None = None,
+    speaker_discovery_file: str | None = None,
 ) -> list[str]:
     command = [str(PYTHON), str(PROJECT / "bridge.py"), "--speaker", speaker]
     if speaker_name:
@@ -76,6 +78,10 @@ def _bridge_args(
     command.extend(["--state-file", str(STATE_DIR / "runtime.json")])
     command.extend(["--event-log", event_log or str(HISTORY_FILE)])
     command.extend(["--control-token-file", str(MOBILE_CODE_FILE)])
+    if speaker_config_file:
+        command.extend(["--speaker-config-file", speaker_config_file])
+    if speaker_discovery_file:
+        command.extend(["--speaker-discovery-file", speaker_discovery_file])
     if no_auto_reboot:
         command.append("--no-auto-reboot")
     return command
@@ -93,7 +99,13 @@ def _run_watchdog(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     command = _bridge_args(
-        args.speaker, args.relay_url, args.no_auto_reboot, args.event_log, args.speaker_name
+        args.speaker,
+        args.relay_url,
+        args.no_auto_reboot,
+        args.event_log,
+        args.speaker_name,
+        args.speaker_config_file,
+        args.speaker_discovery_file,
     )
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
@@ -162,6 +174,10 @@ def start(args: argparse.Namespace) -> None:
         command.append("--no-auto-reboot")
     if args.event_log:
         command.extend(["--event-log", args.event_log])
+    if args.speaker_config_file:
+        command.extend(["--speaker-config-file", args.speaker_config_file])
+    if args.speaker_discovery_file:
+        command.extend(["--speaker-discovery-file", args.speaker_discovery_file])
     with LOG_FILE.open("ab", buffering=0) as log:
         process = subprocess.Popen(
             command,
@@ -225,7 +241,7 @@ def mobile_code(_args: argparse.Namespace) -> None:
     relay_url = config.get("relayURL") if isinstance(config, dict) else None
     print(f"Phone web app: {relay_url or 'http://<this-mac-ip>:8765'}")
     print(f"Pairing code: {code}")
-    print("Enter this code in the phone browser. Paired sessions end when TouchSound restarts; the code remains valid.")
+    print("Enter this code in the phone browser. Paired sessions survive TouchSound restarts and expire after 30 days.")
 
 
 def cycle_speaker(args: argparse.Namespace) -> None:
@@ -245,6 +261,8 @@ def main() -> None:
     start_parser.add_argument("--speaker-name", help="Friendly speaker name shown in the phone app")
     start_parser.add_argument("--relay-url", help="LAN URL the speaker can reach")
     start_parser.add_argument("--event-log", help="Path for the 48-hour speaker state history")
+    start_parser.add_argument("--speaker-config-file", help="TouchSound config file used for phone speaker switching")
+    start_parser.add_argument("--speaker-discovery-file", help="Bonjour speaker inventory for phone speaker switching")
     start_parser.add_argument("--no-auto-reboot", action="store_true", help="Disable automatic speaker reboot")
     start_parser.set_defaults(handler=start)
     stop_parser = commands.add_parser("stop", help="Stop the watchdog and bridge")
@@ -264,6 +282,8 @@ def main() -> None:
     run_parser.add_argument("--relay-url")
     run_parser.add_argument("--no-auto-reboot", action="store_true")
     run_parser.add_argument("--event-log")
+    run_parser.add_argument("--speaker-config-file")
+    run_parser.add_argument("--speaker-discovery-file")
     run_parser.set_defaults(handler=_run_watchdog)
     args = parser.parse_args()
     args.handler(args)
